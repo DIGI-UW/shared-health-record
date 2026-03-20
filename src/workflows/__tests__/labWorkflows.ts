@@ -1,7 +1,7 @@
 import { R4 } from '@ahryman40k/ts-fhir-types'
 import got from 'got'
 import { LabWorkflows } from '../labWorkflows'
-const IG_URL = 'https://i-tech-uw.github.io/laboratory-workflows-ig'
+const IG_URL = 'https://digi-uw.github.io/laboratory-workflows-ig'
 let patient: R4.IPatient
 
 beforeAll(async () => {
