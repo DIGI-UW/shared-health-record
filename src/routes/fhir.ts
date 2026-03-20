@@ -82,8 +82,14 @@ router.get('/:resource/:id?/:operation?', async (req: Request, res: Response) =>
     }
 
     res.status(200).json(result)
-  } catch (error) {
-    return res.status(500).json(error)
+  } catch (error: any) {
+    const statusCode = error?.response?.statusCode || 500
+    const body = error?.response?.body
+    try {
+      return res.status(statusCode).json(body ? JSON.parse(body) : { error: error.message })
+    } catch {
+      return res.status(statusCode).json({ error: error.message })
+    }
   }
 })
 
@@ -107,8 +113,14 @@ router.post('/', async (req, res) => {
     const ret = await got.post(uri.toString(), { json: resource })
 
     res.status(ret.statusCode).json(JSON.parse(ret.body))
-  } catch (error) {
-    return res.status(500).json(error)
+  } catch (error: any) {
+    const statusCode = error?.response?.statusCode || 500
+    const body = error?.response?.body
+    try {
+      return res.status(statusCode).json(body ? JSON.parse(body) : { error: error.message })
+    } catch {
+      return res.status(statusCode).json({ error: error.message })
+    }
   }
 })
 
@@ -166,8 +178,17 @@ export async function saveResource(req: any, res: any, operation?: string) {
     });
 
     res.status(ret.statusCode).json(JSON.parse(ret.body))
-  } catch (error) {
-    res.status(500).json(errorFromHapi || error)
+  } catch (error: any) {
+    const statusCode = error?.response?.statusCode || 500
+    if (errorFromHapi) {
+      return res.status(statusCode).json(errorFromHapi)
+    }
+    const body = error?.response?.body
+    try {
+      return res.status(statusCode).json(body ? JSON.parse(body) : { error: error.message })
+    } catch {
+      return res.status(statusCode).json({ error: error.message })
+    }
   }
 }
     
