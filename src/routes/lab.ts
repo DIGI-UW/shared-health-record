@@ -17,7 +17,7 @@ router.all('/', async (req: Request, res: Response) => {
       'https://b-techbw.github.io/bw-lab-ig/Task-example-laboratory-task-simple-requested.json'
     ).json()
     const patient: R4.IPatient = <R4.IPatient><unknown>got(
-      'https://i-tech-uw.github.io/laboratory-workflows-ig/Patient-example-laboratory-patient.json'
+      'https://digi-uw.github.io/laboratory-workflows-ig/Patient-example-laboratory-patient.json'
     ).json()
 
     // Temporary Testing Bundle

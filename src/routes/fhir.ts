@@ -106,7 +106,7 @@ router.post('/', async (req, res) => {
 
     const ret = await got.post(uri.toString(), { json: resource })
 
-    res.status(ret.statusCode).json(ret.body)
+    res.status(ret.statusCode).json(JSON.parse(ret.body))
   } catch (error) {
     return res.status(500).json(error)
   }

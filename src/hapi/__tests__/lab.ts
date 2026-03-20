@@ -5,7 +5,7 @@ import nock from 'nock'
 import { config } from '../../lib/config'
 import { getResource, saveBundle, translateToTransactionBundle } from '../lab'
 
-const IG_URL = 'https://i-tech-uw.github.io/laboratory-workflows-ig'
+const IG_URL = 'https://digi-uw.github.io/laboratory-workflows-ig'
 
 const fhirUrl: string = config.get('fhirServer:baseURL')
 
