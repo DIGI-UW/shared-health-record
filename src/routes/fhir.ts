@@ -11,6 +11,102 @@ import { getMetadata } from '../lib/helpers'
 
 export const router = express.Router()
 
+const GOLDEN_RECORD_CODE = '5c827da5-4858-4f3d-a50c-62ece001efea'
+
+/**
+ * Look up a Patient's golden record (master patient ID) in the Client Registry.
+ * If found, adds a Patient.link entry pointing to the golden record.
+ * This ensures the SHR stores patients with their MPI identifier,
+ * enabling cross-facility longitudinal queries.
+ *
+ * Returns the enriched patient resource, or the original if no CR match found.
+ */
+async function resolvePatientMpi(patient: any): Promise<any> {
+  const crUrl = config.get('clientRegistryUrl')
+  if (!crUrl || !patient || patient.resourceType !== 'Patient') {
+    return patient
+  }
+
+  try {
+    // Search CR by patient identifiers
+    const identifiers = patient.identifier || []
+    let goldenRecordId: string | null = null
+
+    for (const identifier of identifiers) {
+      if (!identifier.system || !identifier.value) continue
+
+      const searchUrl = `${crUrl}/Patient?identifier=${encodeURIComponent(identifier.system)}|${encodeURIComponent(identifier.value)}&_include=Patient:link`
+      logger.info(`MPI lookup: ${identifier.system}|${identifier.value}`)
+
+      const options = {
+        username: config.get('fhirServer:username'),
+        password: config.get('fhirServer:password'),
+      }
+
+      const response: any = await got.get(searchUrl, options).json()
+
+      if (response && response.entry) {
+        // Find the golden record (tagged with the golden record code)
+        for (const entry of response.entry) {
+          const resource = entry.resource
+          if (
+            resource &&
+            resource.meta &&
+            resource.meta.tag &&
+            resource.meta.tag.some((t: any) => t.code === GOLDEN_RECORD_CODE)
+          ) {
+            goldenRecordId = resource.id
+            break
+          }
+        }
+      }
+
+      if (goldenRecordId) break // Found a match, stop searching
+    }
+
+    if (goldenRecordId) {
+      logger.info(`MPI resolved: Patient/${patient.id} → golden record ${goldenRecordId}`)
+
+      // Add link to golden record if not already present
+      if (!patient.link) patient.link = []
+
+      const alreadyLinked = patient.link.some(
+        (l: any) => l.other && l.other.reference === `Patient/${goldenRecordId}`,
+      )
+
+      if (!alreadyLinked) {
+        patient.link.push({
+          other: { reference: `Patient/${goldenRecordId}` },
+          type: 'refer',
+        })
+      }
+    } else {
+      logger.info(`MPI lookup: no golden record found for Patient/${patient.id}`)
+    }
+  } catch (error: any) {
+    // MPI lookup failure should not block the write
+    logger.warn(`MPI lookup failed for Patient/${patient.id}: ${error.message}`)
+  }
+
+  return patient
+}
+
+/**
+ * Enrich a FHIR Bundle by resolving Patient resources against the MPI.
+ * Non-Patient resources are passed through unchanged.
+ */
+async function enrichBundleWithMpi(bundle: any): Promise<any> {
+  if (!bundle || !bundle.entry) return bundle
+
+  for (const entry of bundle.entry) {
+    if (entry.resource && entry.resource.resourceType === 'Patient') {
+      entry.resource = await resolvePatientMpi(entry.resource)
+    }
+  }
+
+  return bundle
+}
+
 router.get('/', (req: Request, res: Response) => {
   return res.status(200).send(req.url)
 })
@@ -93,11 +189,11 @@ router.get('/:resource/:id?/:operation?', async (req: Request, res: Response) =>
   }
 })
 
-// Post a bundle of resources
+// Post a bundle of resources — enriched with MPI golden record links
 router.post('/', async (req, res) => {
   try {
     logger.info('Received a request to add a bundle of resources')
-    const resource = req.body
+    let resource = req.body
 
     // Verify the bundle
     if (invalidBundle(resource)) {
@@ -107,6 +203,9 @@ router.post('/', async (req, res) => {
     if (resource.entry.length === 0) {
       return res.status(400).json(invalidBundleMessage())
     }
+
+    // Resolve Patient resources against the MPI before saving
+    resource = await enrichBundleWithMpi(resource)
 
     const uri = URI(config.get('fhirServer:baseURL'))
 
@@ -137,7 +236,7 @@ router.put('/:resourceType/:id', (req: any, res: any) => {
 /** Helpers */
 
 export async function saveResource(req: any, res: any, operation?: string) {
-  const resource = req.body
+  let resource = req.body
   const resourceType = req.params.resourceType
   const id = req.params.id
   if (id && !resource.id) {
@@ -145,7 +244,12 @@ export async function saveResource(req: any, res: any, operation?: string) {
   }
 
   logger.info('Received a request to add resource type ' + resourceType + ' with id ' + id)
-  
+
+  // Resolve Patient against MPI before saving
+  if (resourceType === 'Patient') {
+    resource = await resolvePatientMpi(resource)
+  }
+
   let ret, uri, errorFromHapi
   try {
     if (req.method === 'POST') {
@@ -158,7 +262,7 @@ export async function saveResource(req: any, res: any, operation?: string) {
       return
     }
 
-    // Perform  request
+    // Perform request
     logger.info('Sending ' + req.method + ' request to ' + uri)
     ret = await got({
       method: req.method,
