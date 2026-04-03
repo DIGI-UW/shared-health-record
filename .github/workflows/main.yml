@@ -42,7 +42,7 @@ jobs:
       - name: Run Jest Tests
         run: yarn test:unit
 
-  build-test-push:
+  build-and-deploy:
     # Skip Docker build/push for PRs from forks (repo secrets not available)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 10
