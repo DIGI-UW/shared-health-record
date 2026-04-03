@@ -38,7 +38,7 @@ async function resolvePatientMpi(patient: any): Promise<any> {
     username: config.get('fhirServer:username'),
     password: config.get('fhirServer:password'),
     timeout: { request: MPI_LOOKUP_TIMEOUT_MS },
-    retry: { limit: 1, methods: ['GET'] },
+    retry: { limit: 1, methods: ['GET' as const] },
   }
 
   for (const identifier of identifiers) {
@@ -102,13 +102,18 @@ async function resolvePatientMpi(patient: any): Promise<any> {
 async function enrichBundleWithMpi(bundle: any): Promise<any> {
   if (!bundle || !bundle.entry) return bundle
 
-  const resolutions = bundle.entry.map(async (entry: any) => {
+  const resolutions = bundle.entry.map((entry: any) => {
     if (entry.resource && entry.resource.resourceType === 'Patient') {
-      entry.resource = await resolvePatientMpi(entry.resource)
+      return resolvePatientMpi(entry.resource).then((resolved: any) => {
+        entry.resource = resolved
+      }).catch((err: any) => {
+        logger.warn(`MPI enrichment failed for Patient/${entry.resource.id}: ${err.message}`)
+      })
     }
+    return Promise.resolve()
   })
 
-  await Promise.allSettled(resolutions)
+  await Promise.all(resolutions)
 
   return bundle
 }
