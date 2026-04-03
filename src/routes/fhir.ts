@@ -68,7 +68,7 @@ async function resolvePatientMpi(patient: any): Promise<any> {
       if (goldenRecordId) break // Found a match, stop searching
     } catch (error: any) {
       // Log and continue to the next identifier
-      logger.warn(`MPI lookup failed for identifier ${identifier.system}|${identifier.value}: ${error.message}`)
+      logger.warn(`MPI lookup failed for identifier ${identifier.system}|${identifier.value.substring(0, 3)}***: ${error.message}`)
     }
   }
 
