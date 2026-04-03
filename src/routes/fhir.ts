@@ -44,9 +44,12 @@ async function resolvePatientMpi(patient: any): Promise<any> {
   for (const identifier of identifiers) {
     if (!identifier.system || !identifier.value) continue
 
+    const idValue = String(identifier.value)
+    const maskedValue = idValue.slice(0, 3) + '***'
+
     try {
-      const searchUrl = `${crUrl}/Patient?identifier=${encodeURIComponent(identifier.system)}|${encodeURIComponent(identifier.value)}&_include=Patient:link`
-      logger.debug(`MPI lookup: ${identifier.system}|${identifier.value.substring(0, 3)}***`)
+      const searchUrl = `${crUrl}/Patient?identifier=${encodeURIComponent(identifier.system)}|${encodeURIComponent(idValue)}&_include=Patient:link`
+      logger.debug(`MPI lookup: ${identifier.system}|${maskedValue}`)
 
       const response: any = await got.get(searchUrl, options).json()
 
@@ -68,7 +71,7 @@ async function resolvePatientMpi(patient: any): Promise<any> {
       if (goldenRecordId) break // Found a match, stop searching
     } catch (error: any) {
       // Log and continue to the next identifier
-      logger.warn(`MPI lookup failed for identifier ${identifier.system}|${identifier.value.substring(0, 3)}***: ${error.message}`)
+      logger.warn(`MPI lookup failed for identifier ${identifier.system}|${maskedValue}: ${error.message}`)
     }
   }
 
