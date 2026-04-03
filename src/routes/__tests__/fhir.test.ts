@@ -1,12 +1,23 @@
 import request from 'supertest'
 import express from 'express'
 import { router } from '../fhir'
-import got from 'got'
 import { saveResource } from '../fhir'
 
 const app = express()
 app.use(express.json())
 app.use('/', router)
+
+// Mock got at module level so all methods are available for spying
+const mockGotGet = jest.fn()
+const mockGotPost = jest.fn()
+const mockGotDefault = jest.fn()
+
+jest.mock('got', () => {
+  const fn = (...args: any[]) => mockGotDefault(...args)
+  fn.get = (...args: any[]) => mockGotGet(...args)
+  fn.post = (...args: any[]) => mockGotPost(...args)
+  return { __esModule: true, default: fn }
+})
 
 // Mock config
 jest.mock('../../lib/config', () => ({
@@ -22,6 +33,34 @@ jest.mock('../../lib/config', () => ({
   },
 }))
 
+const GOLDEN_RECORD_ID = 'b8115fb4-ea19-4578-bc50-05d4a17ca0c7'
+const GOLDEN_RECORD_CODE = '5c827da5-4858-4f3d-a50c-62ece001efea'
+
+const crResponseWithGoldenRecord = {
+  resourceType: 'Bundle',
+  entry: [
+    {
+      resource: {
+        resourceType: 'Patient',
+        id: 'abc-123',
+        meta: { tag: [{ code: 'some-other-code' }] },
+      },
+    },
+    {
+      resource: {
+        resourceType: 'Patient',
+        id: GOLDEN_RECORD_ID,
+        meta: { tag: [{ code: GOLDEN_RECORD_CODE }] },
+      },
+    },
+  ],
+}
+
+const crResponseNoMatch = {
+  resourceType: 'Bundle',
+  entry: [],
+}
+
 describe('FHIR Routes', () => {
   it.skip('should return 200 OK for GET /metadata', async () => {
     const response = await request(app).get('/metadata')
@@ -36,6 +75,8 @@ describe('FHIR Routes', () => {
 })
 
 it('should return 500 Internal Server Error when the post request fails', async () => {
+  mockGotDefault.mockRejectedValueOnce(new Error('request failed'))
+
   const req = {
     body: {},
     params: {
@@ -49,19 +90,120 @@ it('should return 500 Internal Server Error when the post request fails', async 
     json: jest.fn(),
   }
 
-  jest.spyOn(got, 'post').mockRejectedValue(new Error('Post request failed'))
-
   await saveResource(req, res)
 
   expect(res.status).toHaveBeenCalledWith(500)
 })
 
-describe('MPI Resolution on Write Path', () => {
+describe('MPI Resolution via saveResource (POST /Patient, PUT /Patient/:id)', () => {
   afterEach(() => {
-    jest.restoreAllMocks()
+    mockGotGet.mockReset()
+    mockGotPost.mockReset()
+    mockGotDefault.mockReset()
   })
 
-  const goldenRecordId = 'b8115fb4-ea19-4578-bc50-05d4a17ca0c7'
+  const patientBody = {
+    resourceType: 'Patient',
+    id: 'pt-001',
+    name: [{ family: 'Baptiste', given: ['Jean'] }],
+    identifier: [
+      { system: 'http://isanteplus.org/openmrs/fhir2/5-code-national', value: '99999' },
+    ],
+  }
+
+  it('POST /Patient resolves MPI and adds golden record link', async () => {
+    mockGotGet.mockReturnValue({
+      json: () => Promise.resolve(crResponseWithGoldenRecord),
+    })
+
+    mockGotDefault.mockResolvedValue({
+      statusCode: 201,
+      body: JSON.stringify({ resourceType: 'Patient', id: 'pt-001' }),
+    })
+
+    const response = await request(app).post('/Patient').send(patientBody)
+
+    expect(response.status).toBe(201)
+
+    // Verify the CR was queried
+    expect(mockGotGet).toHaveBeenCalled()
+    const crCallUrl = String(mockGotGet.mock.calls[0][0])
+    expect(crCallUrl).toContain('Patient?identifier=')
+
+    // Verify the resource sent to HAPI includes the golden record link
+    const hapiCall = mockGotDefault.mock.calls[0][0]
+    expect(hapiCall.json.link).toContainEqual({
+      other: { reference: `Patient/${GOLDEN_RECORD_ID}` },
+      type: 'refer',
+    })
+  })
+
+  it('PUT /Patient/:id resolves MPI and adds golden record link', async () => {
+    mockGotGet.mockReturnValue({
+      json: () => Promise.resolve(crResponseWithGoldenRecord),
+    })
+
+    mockGotDefault.mockResolvedValue({
+      statusCode: 200,
+      body: JSON.stringify({ resourceType: 'Patient', id: 'pt-001' }),
+    })
+
+    const response = await request(app).put('/Patient/pt-001').send(patientBody)
+
+    expect(response.status).toBe(200)
+
+    // Verify the resource sent to HAPI includes the golden record link
+    const hapiCall = mockGotDefault.mock.calls[0][0]
+    expect(hapiCall.json.link).toContainEqual({
+      other: { reference: `Patient/${GOLDEN_RECORD_ID}` },
+      type: 'refer',
+    })
+    expect(hapiCall.method).toBe('PUT')
+    expect(hapiCall.url).toContain('Patient/pt-001')
+  })
+
+  it('POST /Patient succeeds when CR is unavailable (non-blocking)', async () => {
+    mockGotGet.mockReturnValue({
+      json: () => Promise.reject(new Error('ECONNREFUSED')),
+    })
+
+    mockGotDefault.mockResolvedValue({
+      statusCode: 201,
+      body: JSON.stringify({ resourceType: 'Patient', id: 'pt-001' }),
+    })
+
+    const response = await request(app).post('/Patient').send(patientBody)
+
+    // Write should still succeed
+    expect(response.status).toBe(201)
+
+    // Patient saved without a link
+    const hapiCall = mockGotDefault.mock.calls[0][0]
+    expect(hapiCall.json.link).toBeUndefined()
+  })
+
+  it('POST /Observation skips MPI resolution', async () => {
+    mockGotDefault.mockResolvedValue({
+      statusCode: 201,
+      body: JSON.stringify({ resourceType: 'Observation', id: 'obs-1' }),
+    })
+
+    const response = await request(app)
+      .post('/Observation')
+      .send({ resourceType: 'Observation', id: 'obs-1', status: 'final' })
+
+    expect(response.status).toBe(201)
+    // CR should NOT be queried for non-Patient resources
+    expect(mockGotGet).not.toHaveBeenCalled()
+  })
+})
+
+describe('MPI Resolution on Bundle Write Path', () => {
+  afterEach(() => {
+    mockGotGet.mockReset()
+    mockGotPost.mockReset()
+    mockGotDefault.mockReset()
+  })
 
   const makePatientBundle = (patient: any) => ({
     resourceType: 'Bundle',
@@ -84,42 +226,15 @@ describe('MPI Resolution on Write Path', () => {
     ],
   }
 
-  const crResponseWithGoldenRecord = {
-    resourceType: 'Bundle',
-    entry: [
-      {
-        resource: {
-          resourceType: 'Patient',
-          id: 'abc-123',
-          meta: { tag: [{ code: 'some-other-code' }] },
-        },
-      },
-      {
-        resource: {
-          resourceType: 'Patient',
-          id: goldenRecordId,
-          meta: { tag: [{ code: '5c827da5-4858-4f3d-a50c-62ece001efea' }] },
-        },
-      },
-    ],
-  }
-
-  const crResponseNoMatch = {
-    resourceType: 'Bundle',
-    entry: [],
-  }
-
   it('adds Patient.link to golden record when CR finds a match', async () => {
-    // Mock CR lookup returns golden record
-    const getSpy = jest.spyOn(got, 'get').mockReturnValue({
+    mockGotGet.mockReturnValue({
       json: () => Promise.resolve(crResponseWithGoldenRecord),
-    } as any)
+    })
 
-    // Mock HAPI FHIR write succeeds
-    jest.spyOn(got, 'post').mockResolvedValue({
+    mockGotPost.mockResolvedValue({
       statusCode: 200,
       body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
-    } as any)
+    })
 
     const bundle = makePatientBundle(patientWithIdentifiers)
     const response = await request(app).post('/').send(bundle)
@@ -127,32 +242,29 @@ describe('MPI Resolution on Write Path', () => {
     expect(response.status).toBe(200)
 
     // Verify the CR was queried
-    expect(getSpy).toHaveBeenCalled()
-    const crCallUrl = String(getSpy.mock.calls[0][0])
+    expect(mockGotGet).toHaveBeenCalled()
+    const crCallUrl = String(mockGotGet.mock.calls[0][0])
     expect(crCallUrl).toContain('CR/fhir/Patient?identifier=')
 
     // Verify the patient sent to HAPI FHIR has the golden record link
-    const postSpy = got.post as jest.Mock
-    const sentBundle = postSpy.mock.calls[0][1].json
+    const sentBundle = mockGotPost.mock.calls[0][1].json
     const patient = sentBundle.entry[0].resource
     expect(patient.link).toBeDefined()
     expect(patient.link).toContainEqual({
-      other: { reference: `Patient/${goldenRecordId}` },
+      other: { reference: `Patient/${GOLDEN_RECORD_ID}` },
       type: 'refer',
     })
   })
 
   it('writes patient without link when CR finds no match', async () => {
-    // Mock CR lookup returns no match
-    jest.spyOn(got, 'get').mockReturnValue({
+    mockGotGet.mockReturnValue({
       json: () => Promise.resolve(crResponseNoMatch),
-    } as any)
+    })
 
-    // Mock HAPI FHIR write succeeds
-    jest.spyOn(got, 'post').mockResolvedValue({
+    mockGotPost.mockResolvedValue({
       statusCode: 200,
       body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
-    } as any)
+    })
 
     const bundle = makePatientBundle(patientWithIdentifiers)
     const response = await request(app).post('/').send(bundle)
@@ -160,23 +272,20 @@ describe('MPI Resolution on Write Path', () => {
     expect(response.status).toBe(200)
 
     // Verify patient was sent without a link
-    const postSpy = got.post as jest.Mock
-    const sentBundle = postSpy.mock.calls[0][1].json
+    const sentBundle = mockGotPost.mock.calls[0][1].json
     const patient = sentBundle.entry[0].resource
     expect(patient.link).toBeUndefined()
   })
 
   it('writes patient successfully when CR is unavailable (graceful failure)', async () => {
-    // Mock CR lookup throws (timeout/network error)
-    jest.spyOn(got, 'get').mockReturnValue({
+    mockGotGet.mockReturnValue({
       json: () => Promise.reject(new Error('ECONNREFUSED')),
-    } as any)
+    })
 
-    // Mock HAPI FHIR write succeeds
-    jest.spyOn(got, 'post').mockResolvedValue({
+    mockGotPost.mockResolvedValue({
       statusCode: 200,
       body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
-    } as any)
+    })
 
     const bundle = makePatientBundle(patientWithIdentifiers)
     const response = await request(app).post('/').send(bundle)
@@ -185,27 +294,26 @@ describe('MPI Resolution on Write Path', () => {
     expect(response.status).toBe(200)
 
     // Patient should be saved without a link
-    const postSpy = got.post as jest.Mock
-    const sentBundle = postSpy.mock.calls[0][1].json
+    const sentBundle = mockGotPost.mock.calls[0][1].json
     const patient = sentBundle.entry[0].resource
     expect(patient.link).toBeUndefined()
   })
 
   it('tries remaining identifiers when first lookup fails', async () => {
-    const getSpy = jest.spyOn(got, 'get')
+    mockGotGet
       // First identifier lookup fails
       .mockReturnValueOnce({
         json: () => Promise.reject(new Error('timeout on first identifier')),
-      } as any)
+      })
       // Second identifier lookup succeeds with golden record
       .mockReturnValueOnce({
         json: () => Promise.resolve(crResponseWithGoldenRecord),
-      } as any)
+      })
 
-    jest.spyOn(got, 'post').mockResolvedValue({
+    mockGotPost.mockResolvedValue({
       statusCode: 200,
       body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
-    } as any)
+    })
 
     const bundle = makePatientBundle(patientWithIdentifiers)
     const response = await request(app).post('/').send(bundle)
@@ -213,14 +321,13 @@ describe('MPI Resolution on Write Path', () => {
     expect(response.status).toBe(200)
 
     // Both identifiers should have been tried
-    expect(getSpy).toHaveBeenCalledTimes(2)
+    expect(mockGotGet).toHaveBeenCalledTimes(2)
 
     // Patient should have the golden record link from the second lookup
-    const postSpy = got.post as jest.Mock
-    const sentBundle = postSpy.mock.calls[0][1].json
+    const sentBundle = mockGotPost.mock.calls[0][1].json
     const patient = sentBundle.entry[0].resource
     expect(patient.link).toContainEqual({
-      other: { reference: `Patient/${goldenRecordId}` },
+      other: { reference: `Patient/${GOLDEN_RECORD_ID}` },
       type: 'refer',
     })
   })
@@ -228,37 +335,34 @@ describe('MPI Resolution on Write Path', () => {
   it('does not duplicate link if already present', async () => {
     const patientWithExistingLink = {
       ...patientWithIdentifiers,
-      link: [{ other: { reference: `Patient/${goldenRecordId}` }, type: 'refer' }],
+      link: [{ other: { reference: `Patient/${GOLDEN_RECORD_ID}` }, type: 'refer' }],
     }
 
-    jest.spyOn(got, 'get').mockReturnValue({
+    mockGotGet.mockReturnValue({
       json: () => Promise.resolve(crResponseWithGoldenRecord),
-    } as any)
+    })
 
-    jest.spyOn(got, 'post').mockResolvedValue({
+    mockGotPost.mockResolvedValue({
       statusCode: 200,
       body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
-    } as any)
+    })
 
     const bundle = makePatientBundle(patientWithExistingLink)
     const response = await request(app).post('/').send(bundle)
 
     expect(response.status).toBe(200)
 
-    const postSpy = got.post as jest.Mock
-    const sentBundle = postSpy.mock.calls[0][1].json
+    const sentBundle = mockGotPost.mock.calls[0][1].json
     const patient = sentBundle.entry[0].resource
     // Should still have exactly one link, not two
     expect(patient.link).toHaveLength(1)
   })
 
   it('skips MPI resolution for non-Patient resources', async () => {
-    const getSpy = jest.spyOn(got, 'get')
-
-    jest.spyOn(got, 'post').mockResolvedValue({
+    mockGotPost.mockResolvedValue({
       statusCode: 200,
       body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
-    } as any)
+    })
 
     const bundle = {
       resourceType: 'Bundle',
@@ -275,6 +379,6 @@ describe('MPI Resolution on Write Path', () => {
 
     expect(response.status).toBe(200)
     // CR should not be queried for Observations
-    expect(getSpy).not.toHaveBeenCalled()
+    expect(mockGotGet).not.toHaveBeenCalled()
   })
 })

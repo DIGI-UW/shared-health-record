@@ -269,9 +269,16 @@ export async function saveResource(req: any, res: any, operation?: string) {
 
   logger.info('Received a request to add resource type ' + resourceType + ' with id ' + id)
 
-  // Resolve Patient against MPI before saving
+  // Resolve Patient against MPI before saving, but do not block the save if MPI resolution fails.
   if (resourceType === 'Patient') {
-    resource = await resolvePatientMpi(resource)
+    try {
+      resource = await resolvePatientMpi(resource)
+    } catch (error: any) {
+      logger.warn(
+        'Failed to resolve Patient against MPI during saveResource; continuing with original resource: ' +
+          (error?.message || String(error))
+      )
+    }
   }
 
   let ret, uri, errorFromHapi
