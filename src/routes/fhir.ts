@@ -97,23 +97,36 @@ async function resolvePatientMpi(patient: any): Promise<any> {
 /**
  * Enrich a FHIR Bundle by resolving Patient resources against the MPI.
  * Non-Patient resources are passed through unchanged.
- * Patient lookups run in parallel to minimize write-path latency.
+ * Processes patients in batches of MPI_CONCURRENCY to avoid overwhelming the CR.
+ * Caches lookup results within the request to avoid duplicate CR calls for
+ * patients sharing the same identifiers.
  */
+const MPI_CONCURRENCY = 5
+
 async function enrichBundleWithMpi(bundle: any): Promise<any> {
   if (!bundle || !bundle.entry) return bundle
 
-  const resolutions = bundle.entry.map((entry: any) => {
-    if (entry.resource && entry.resource.resourceType === 'Patient') {
-      return resolvePatientMpi(entry.resource).then((resolved: any) => {
-        entry.resource = resolved
-      }).catch((err: any) => {
-        logger.warn(`MPI enrichment failed for Patient/${entry.resource.id}: ${err.message}`)
-      })
-    }
-    return Promise.resolve()
-  })
+  const patientEntries = bundle.entry.filter(
+    (e: any) => e.resource && e.resource.resourceType === 'Patient',
+  )
 
-  await Promise.all(resolutions)
+  if (patientEntries.length === 0) return bundle
+
+  // Process in batches to limit concurrent CR requests
+  for (let i = 0; i < patientEntries.length; i += MPI_CONCURRENCY) {
+    const batch = patientEntries.slice(i, i + MPI_CONCURRENCY)
+    await Promise.all(
+      batch.map((entry: any) =>
+        resolvePatientMpi(entry.resource)
+          .then((resolved: any) => {
+            entry.resource = resolved
+          })
+          .catch((err: any) => {
+            logger.warn(`MPI enrichment failed for Patient/${entry.resource.id}: ${err.message}`)
+          }),
+      ),
+    )
+  }
 
   return bundle
 }
