@@ -27,26 +27,24 @@ async function resolvePatientMpi(patient: any): Promise<any> {
     return patient
   }
 
-  try {
-    // Search CR by patient identifiers
-    const identifiers = patient.identifier || []
-    let goldenRecordId: string | null = null
+  const identifiers = patient.identifier || []
+  let goldenRecordId: string | null = null
 
-    for (const identifier of identifiers) {
-      if (!identifier.system || !identifier.value) continue
+  const options = {
+    username: config.get('fhirServer:username'),
+    password: config.get('fhirServer:password'),
+  }
 
+  for (const identifier of identifiers) {
+    if (!identifier.system || !identifier.value) continue
+
+    try {
       const searchUrl = `${crUrl}/Patient?identifier=${encodeURIComponent(identifier.system)}|${encodeURIComponent(identifier.value)}&_include=Patient:link`
       logger.info(`MPI lookup: ${identifier.system}|${identifier.value}`)
-
-      const options = {
-        username: config.get('fhirServer:username'),
-        password: config.get('fhirServer:password'),
-      }
 
       const response: any = await got.get(searchUrl, options).json()
 
       if (response && response.entry) {
-        // Find the golden record (tagged with the golden record code)
         for (const entry of response.entry) {
           const resource = entry.resource
           if (
@@ -62,30 +60,29 @@ async function resolvePatientMpi(patient: any): Promise<any> {
       }
 
       if (goldenRecordId) break // Found a match, stop searching
+    } catch (error: any) {
+      // Log and continue to the next identifier
+      logger.warn(`MPI lookup failed for identifier ${identifier.system}|${identifier.value}: ${error.message}`)
     }
+  }
 
-    if (goldenRecordId) {
-      logger.info(`MPI resolved: Patient/${patient.id} → golden record ${goldenRecordId}`)
+  if (goldenRecordId) {
+    logger.info(`MPI resolved: Patient/${patient.id} → golden record ${goldenRecordId}`)
 
-      // Add link to golden record if not already present
-      if (!patient.link) patient.link = []
+    if (!patient.link) patient.link = []
 
-      const alreadyLinked = patient.link.some(
-        (l: any) => l.other && l.other.reference === `Patient/${goldenRecordId}`,
-      )
+    const alreadyLinked = patient.link.some(
+      (l: any) => l.other && l.other.reference === `Patient/${goldenRecordId}`,
+    )
 
-      if (!alreadyLinked) {
-        patient.link.push({
-          other: { reference: `Patient/${goldenRecordId}` },
-          type: 'refer',
-        })
-      }
-    } else {
-      logger.info(`MPI lookup: no golden record found for Patient/${patient.id}`)
+    if (!alreadyLinked) {
+      patient.link.push({
+        other: { reference: `Patient/${goldenRecordId}` },
+        type: 'refer',
+      })
     }
-  } catch (error: any) {
-    // MPI lookup failure should not block the write
-    logger.warn(`MPI lookup failed for Patient/${patient.id}: ${error.message}`)
+  } else {
+    logger.info(`MPI lookup: no golden record found for Patient/${patient.id}`)
   }
 
   return patient
