@@ -13,6 +13,10 @@ export const router = express.Router()
 
 const GOLDEN_RECORD_CODE = '5c827da5-4858-4f3d-a50c-62ece001efea'
 
+// Timeout for MPI lookups — prevents slow CR from stalling SHR writes.
+// Falls back to 5 seconds if not configured.
+const MPI_LOOKUP_TIMEOUT_MS = config.get('mpiLookupTimeoutMs') || 5000
+
 /**
  * Look up a Patient's golden record (master patient ID) in the Client Registry.
  * If found, adds a Patient.link entry pointing to the golden record.
@@ -33,6 +37,8 @@ async function resolvePatientMpi(patient: any): Promise<any> {
   const options = {
     username: config.get('fhirServer:username'),
     password: config.get('fhirServer:password'),
+    timeout: { request: MPI_LOOKUP_TIMEOUT_MS },
+    retry: { limit: 1, methods: ['GET'] },
   }
 
   for (const identifier of identifiers) {
@@ -40,7 +46,7 @@ async function resolvePatientMpi(patient: any): Promise<any> {
 
     try {
       const searchUrl = `${crUrl}/Patient?identifier=${encodeURIComponent(identifier.system)}|${encodeURIComponent(identifier.value)}&_include=Patient:link`
-      logger.info(`MPI lookup: ${identifier.system}|${identifier.value}`)
+      logger.debug(`MPI lookup: ${identifier.system}|${identifier.value.substring(0, 3)}***`)
 
       const response: any = await got.get(searchUrl, options).json()
 
