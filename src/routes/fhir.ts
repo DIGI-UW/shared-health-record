@@ -101,8 +101,6 @@ async function resolvePatientMpi(patient: any): Promise<any> {
  * Enrich a FHIR Bundle by resolving Patient resources against the MPI.
  * Non-Patient resources are passed through unchanged.
  * Processes patients in batches of MPI_CONCURRENCY to avoid overwhelming the CR.
- * Caches lookup results within the request to avoid duplicate CR calls for
- * patients sharing the same identifiers.
  */
 const MPI_CONCURRENCY = 5
 
