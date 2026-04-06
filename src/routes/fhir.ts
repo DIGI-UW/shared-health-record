@@ -40,8 +40,8 @@ async function resolvePatientMpi(patient: any): Promise<any> {
   let goldenRecordId: string | null = null
 
   const options = {
-    username: config.get('fhirServer:username'),
-    password: config.get('fhirServer:password'),
+    username: config.get('clientRegistryUsername') || config.get('fhirServer:username'),
+    password: config.get('clientRegistryPassword') || config.get('fhirServer:password'),
     timeout: { request: MPI_LOOKUP_TIMEOUT_MS },
     retry: { limit: 1, methods: ['GET' as const] },
   }
