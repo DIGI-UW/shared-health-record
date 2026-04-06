@@ -3,7 +3,7 @@
 import { R4 } from '@ahryman40k/ts-fhir-types'
 import express, { Request, Response } from 'express'
 import { saveBundle } from '../hapi/lab'
-import { getMetadata, invalidBundle, invalidBundleMessage } from '../lib/helpers'
+import { getMetadata, invalidBundle, invalidBundleMessage, emptyBundle, emptyBundleResponse } from '../lib/helpers'
 import logger from '../lib/winston'
 import { WorkflowHandler } from '../workflows/botswana/workflowHandler'
 
@@ -31,6 +31,10 @@ router.all('/', async (req: Request, res: Response) => {
       // Validate Bundle
       if (invalidBundle(orderBundle)) {
         return res.status(400).json(invalidBundleMessage())
+      }
+
+      if (emptyBundle(orderBundle)) {
+        return res.status(200).json(emptyBundleResponse())
       }
 
       // Save Bundle

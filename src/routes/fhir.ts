@@ -3,7 +3,7 @@ import express, { Request, Response } from 'express'
 import got from 'got'
 import URI from 'urijs'
 import config from '../lib/config'
-import { getHapiPassthrough, invalidBundle, invalidBundleMessage } from '../lib/helpers'
+import { getHapiPassthrough, invalidBundle, invalidBundleMessage, emptyBundle, emptyBundleResponse } from '../lib/helpers'
 import logger from '../lib/winston'
 import { generateSimpleIpsBundle } from '../workflows/ipsWorkflows'
 import { getResourceTypeEnum, isValidResourceType } from '../lib/validate'
@@ -104,8 +104,9 @@ router.post('/', async (req, res) => {
       return res.status(400).json(invalidBundleMessage())
     }
 
-    if (resource.entry.length === 0) {
-      return res.status(400).json(invalidBundleMessage())
+    if (emptyBundle(resource)) {
+      logger.info('Received empty bundle, returning empty response')
+      return res.status(200).json(emptyBundleResponse())
     }
 
     const uri = URI(config.get('fhirServer:baseURL'))
