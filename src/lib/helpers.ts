@@ -8,7 +8,7 @@ export function invalidBundle(resource: any): boolean {
   if (!resource || typeof resource !== 'object' || Array.isArray(resource)) {
     return true
   }
-  if (resource.resourceType !== 'Bundle') {
+  if (!('resourceType' in resource) || resource.resourceType !== 'Bundle') {
     return true
   }
   if ('entry' in resource && !Array.isArray(resource.entry)) {
@@ -21,7 +21,7 @@ export function emptyBundle(resource: any): boolean {
   return !Array.isArray(resource.entry) || resource.entry.length === 0
 }
 
-export function emptyBundleResponse(): any {
+export function emptyBundleResponse() {
   return { resourceType: 'Bundle', type: 'transaction-response', entry: [] }
 }
 
