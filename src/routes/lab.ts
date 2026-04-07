@@ -32,7 +32,7 @@ router.all('/', async (req: Request, res: Response) => {
     }
 
     if (emptyBundle(orderBundle)) {
-      return res.status(200).json(emptyBundleResponse())
+      return res.status(200).json(emptyBundleResponse(orderBundle))
     }
 
     let resultBundle: R4.IBundle

@@ -21,8 +21,14 @@ export function emptyBundle(resource: any): boolean {
   return !Array.isArray(resource.entry) || resource.entry.length === 0
 }
 
-export function emptyBundleResponse() {
-  return { resourceType: 'Bundle', type: 'transaction-response', entry: [] }
+export function emptyBundleResponse(resource?: any) {
+  const bundleType = resource?.type === 'batch'
+    ? 'batch-response'
+    : resource?.type === 'transaction'
+      ? 'transaction-response'
+      : 'transaction-response'
+
+  return { resourceType: 'Bundle', type: bundleType, entry: [] }
 }
 
 export function invalidBundleMessage(): any {

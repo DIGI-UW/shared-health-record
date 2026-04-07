@@ -232,7 +232,7 @@ router.post('/', async (req, res) => {
 
     if (emptyBundle(resource)) {
       logger.info('Received empty bundle, returning empty response')
-      return res.status(200).json(emptyBundleResponse())
+      return res.status(200).json(emptyBundleResponse(resource))
     }
 
     // Resolve Patient resources against the MPI before saving
