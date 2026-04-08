@@ -4,6 +4,8 @@ name: CI/CD
 on:
   pull_request:
     branches: [main]
+  pull_request_target:
+    branches: [main]
   push:
     branches: [main]
   release:
@@ -18,6 +20,8 @@ env:
 
 jobs:
   unit-test:
+    # Run on pull_request (not pull_request_target) to avoid exposing secrets to fork code
+    if: github.event_name != 'pull_request_target'
     timeout-minutes: 20
     permissions:
       contents: read
@@ -43,14 +47,16 @@ jobs:
         run: yarn test:unit
 
   build-and-deploy:
-    # Skip Docker build/push for PRs from forks (repo secrets not available)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Run on pull_request_target (not pull_request) so secrets are available for fork PRs
+    if: github.event_name != 'pull_request'
     timeout-minutes: 10
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Dump github context
         run:   echo "$GITHUB_CONTEXT"
         shell: bash
@@ -81,8 +87,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request_target' }}
+          load: ${{ github.event_name == 'pull_request_target' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{github.repository}}:latest
