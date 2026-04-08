@@ -50,6 +50,8 @@ jobs:
     # Run on pull_request_target (not pull_request) so secrets are available for fork PRs
     if: github.event_name != 'pull_request'
     timeout-minutes: 10
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
 
     steps:
