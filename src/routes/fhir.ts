@@ -5,6 +5,7 @@ import URI from 'urijs'
 import config from '../lib/config'
 import { emptyBundle, emptyBundleResponse, getHapiPassthrough, invalidBundle, invalidBundleMessage } from '../lib/helpers'
 import logger from '../lib/winston'
+import { R4 } from '@ahryman40k/ts-fhir-types'
 import { generateCrossFacilityIpsBundle, generateSimpleIpsBundle } from '../workflows/ipsWorkflows'
 import { getResourceTypeEnum, isValidResourceType } from '../lib/validate'
 import { getMetadata } from '../lib/helpers'
@@ -31,12 +32,12 @@ const MPI_LOOKUP_TIMEOUT_MS =
  * Returns the enriched patient resource, or the original if no CR match found.
  */
 interface MpiResolution {
-  patient: any
+  patient: R4.IPatient
   goldenRecordId: string | null
-  crSourcePatients: any[]
+  crSourcePatients: R4.IPatient[]
 }
 
-async function resolvePatientMpi(patient: any): Promise<MpiResolution> {
+async function resolvePatientMpi(patient: R4.IPatient): Promise<MpiResolution> {
   const crUrl = config.get('clientRegistryUrl')
   if (!crUrl || !patient || patient.resourceType !== 'Patient') {
     return { patient, goldenRecordId: null, crSourcePatients: [] }
@@ -44,7 +45,7 @@ async function resolvePatientMpi(patient: any): Promise<MpiResolution> {
 
   const identifiers = patient.identifier ? (Array.isArray(patient.identifier) ? patient.identifier  :  [patient.identifier]): []
   let goldenRecordId: string | null = null
-  let crSourcePatients: any[] = []
+  const crSourcePatients: R4.IPatient[] = []
 
   const options = {
     username: config.get('clientRegistryUsername') || config.get('fhirServer:username'),
@@ -100,7 +101,7 @@ async function resolvePatientMpi(patient: any): Promise<MpiResolution> {
     if (!alreadyLinked) {
       patient.link.push({
         other: { reference: `Patient/${goldenRecordId}` },
-        type: 'refer',
+        type: R4.Patient_LinkTypeKind._refer,
       })
     }
   } else {
@@ -123,9 +124,9 @@ async function resolvePatientMpi(patient: any): Promise<MpiResolution> {
  */
 function buildGoldenRecordPatient(
   goldenRecordId: string,
-  crSourcePatients: any[],
+  crSourcePatients: R4.IPatient[],
   shrSourcePatientIds: string[],
-): any {
+): R4.IPatient {
   // Sort sources by lastUpdated descending — most recent first
   const sorted = [...crSourcePatients].sort((a, b) => {
     const ta = a.meta?.lastUpdated || ''
@@ -134,8 +135,8 @@ function buildGoldenRecordPatient(
   })
 
   // Resolve official name: pick from the most recent source that has one
-  let officialName: any = null
-  const allNames: any[] = []
+  let officialName: R4.IHumanName | null = null
+  const allNames: R4.IHumanName[] = []
   const seenNames = new Set<string>()
 
   for (const source of sorted) {
@@ -152,7 +153,7 @@ function buildGoldenRecordPatient(
   }
 
   // Build the name array: official name first, then others
-  const names: any[] = []
+  const names: R4.IHumanName[] = []
   if (officialName) {
     names.push(officialName)
   }
@@ -176,7 +177,7 @@ function buildGoldenRecordPatient(
   const birthDate = mostRecent?.birthDate
 
   // Merge identifiers from all sources, deduplicated
-  const identifiers: any[] = []
+  const identifiers: R4.IIdentifier[] = []
   const seenIds = new Set<string>()
   for (const source of crSourcePatients) {
     for (const ident of source.identifier || []) {
@@ -198,7 +199,7 @@ function buildGoldenRecordPatient(
     birthDate,
     link: shrSourcePatientIds.map(pid => ({
       other: { reference: `Patient/${pid}` },
-      type: 'seealso',
+      type: R4.Patient_LinkTypeKind._seealso,
     })),
   }
 }
@@ -208,7 +209,7 @@ function buildGoldenRecordPatient(
  * resolved from OpenCR source patients. Runs as a background operation
  * so it does not block the main write path.
  */
-async function updateGoldenRecordInShr(goldenRecordId: string, crSourcePatients: any[], shrSourcePatientIds: string[]): Promise<void> {
+async function updateGoldenRecordInShr(goldenRecordId: string, crSourcePatients: R4.IPatient[], shrSourcePatientIds: string[]): Promise<void> {
   const fhirBase = config.get('fhirServer:baseURL')
   try {
     const goldenPatient = buildGoldenRecordPatient(goldenRecordId, crSourcePatients, shrSourcePatientIds)
@@ -285,7 +286,7 @@ async function enrichBundleWithMpi(bundle: any): Promise<any> {
   // Build a mapping of facility patient ID → golden record ID
   const patientIdMap = new Map<string, string>()
   // Collect CR source patients per golden record for demographics resolution
-  const goldenRecordSources = new Map<string, any[]>()
+  const goldenRecordSources = new Map<string, R4.IPatient[]>()
   const goldenRecordShrPatients = new Map<string, string[]>()
 
   // Process in batches to limit concurrent CR requests
@@ -297,14 +298,15 @@ async function enrichBundleWithMpi(bundle: any): Promise<any> {
           .then((resolution: MpiResolution) => {
             entry.resource = resolution.patient
             if (resolution.goldenRecordId) {
-              patientIdMap.set(resolution.patient.id, resolution.goldenRecordId)
+              const patientId = resolution.patient.id!
+              patientIdMap.set(patientId, resolution.goldenRecordId)
 
               // Collect CR sources for golden record demographics — merge across resolutions
               if (!goldenRecordSources.has(resolution.goldenRecordId)) {
                 goldenRecordSources.set(resolution.goldenRecordId, [...resolution.crSourcePatients])
               } else {
                 const existing = goldenRecordSources.get(resolution.goldenRecordId)!
-                const existingIds = new Set(existing.map((p: any) => p.id))
+                const existingIds = new Set(existing.map((p: R4.IPatient) => p.id))
                 for (const src of resolution.crSourcePatients) {
                   if (src.id && !existingIds.has(src.id)) {
                     existing.push(src)
@@ -315,7 +317,7 @@ async function enrichBundleWithMpi(bundle: any): Promise<any> {
               if (!goldenRecordShrPatients.has(resolution.goldenRecordId)) {
                 goldenRecordShrPatients.set(resolution.goldenRecordId, [])
               }
-              goldenRecordShrPatients.get(resolution.goldenRecordId)!.push(resolution.patient.id)
+              goldenRecordShrPatients.get(resolution.goldenRecordId)!.push(patientId)
             }
           })
           .catch((err: any) => {
