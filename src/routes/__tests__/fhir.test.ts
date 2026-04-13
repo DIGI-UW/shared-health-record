@@ -2,7 +2,7 @@ import request from 'supertest'
 import express from 'express'
 import { router } from '../fhir'
 import { saveResource } from '../fhir'
-import { invalidBundle, emptyBundle, emptyBundleResponse } from '../../lib/helpers'
+import { emptyBundle, emptyBundleResponse, invalidBundle } from '../../lib/helpers'
 
 const app = express()
 app.use(express.json())
@@ -11,12 +11,14 @@ app.use('/', router)
 // Mock got at module level so all methods are available for spying
 const mockGotGet = jest.fn()
 const mockGotPost = jest.fn()
+const mockGotPut = jest.fn()
 const mockGotDefault = jest.fn()
 
 jest.mock('got', () => {
   const fn = (...args: any[]) => mockGotDefault(...args)
   fn.get = (...args: any[]) => mockGotGet(...args)
   fn.post = (...args: any[]) => mockGotPost(...args)
+  fn.put = (...args: any[]) => mockGotPut(...args)
   return { __esModule: true, default: fn }
 })
 
@@ -454,6 +456,298 @@ describe('emptyBundleResponse', () => {
     expect(resp.resourceType).toBe('Bundle')
     expect(resp.type).toBe('transaction-response')
     expect(resp.entry).toEqual([])
+  })
+})
+
+describe('Reference Rewriting on Bundle Write Path', () => {
+  afterEach(() => {
+    mockGotGet.mockReset()
+    mockGotPost.mockReset()
+    mockGotPut.mockReset()
+    mockGotDefault.mockReset()
+  })
+
+  const crResponseWithSources = {
+    resourceType: 'Bundle',
+    entry: [
+      {
+        resource: {
+          resourceType: 'Patient',
+          id: 'source-hueh',
+          name: [{ use: 'official', family: 'OJOK', given: ['OWITO'] }],
+          gender: 'male',
+          birthDate: '1997',
+          meta: { tag: [{ code: 'hueh' }], lastUpdated: '2026-04-10T07:08:57Z' },
+          identifier: [{ system: 'http://isanteplus.org/openmrs/fhir2/3-isanteplus-id', value: '03N3AN' }],
+        },
+      },
+      {
+        resource: {
+          resourceType: 'Patient',
+          id: GOLDEN_RECORD_ID,
+          meta: { tag: [{ code: GOLDEN_RECORD_CODE }] },
+        },
+      },
+    ],
+  }
+
+  it('rewrites clinical resource patient references to golden record ID', async () => {
+    mockGotGet.mockReturnValue({
+      json: () => Promise.resolve(crResponseWithSources),
+    })
+
+    // Mock the golden record PUT (background update)
+    mockGotPut.mockResolvedValue({ statusCode: 200, body: '{}' })
+
+    mockGotPost.mockResolvedValue({
+      statusCode: 200,
+      body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
+    })
+
+    const bundle = {
+      resourceType: 'Bundle',
+      type: 'transaction',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Patient',
+            id: 'pt-facility-1',
+            identifier: [{ system: 'http://isanteplus.org/openmrs/fhir2/5-code-national', value: '45678' }],
+          },
+          request: { method: 'PUT', url: 'Patient/pt-facility-1' },
+        },
+        {
+          resource: {
+            resourceType: 'AllergyIntolerance',
+            id: 'allergy-1',
+            patient: { reference: 'Patient/pt-facility-1' },
+            code: { text: 'Penicillin' },
+          },
+          request: { method: 'PUT', url: 'AllergyIntolerance/allergy-1' },
+        },
+        {
+          resource: {
+            resourceType: 'Observation',
+            id: 'obs-1',
+            subject: { reference: 'Patient/pt-facility-1' },
+            status: 'final',
+          },
+          request: { method: 'PUT', url: 'Observation/obs-1' },
+        },
+      ],
+    }
+
+    const response = await request(app).post('/').send(bundle)
+    expect(response.status).toBe(200)
+
+    const sentBundle = mockGotPost.mock.calls[0][1].json
+
+    // Patient should have golden record link
+    const patient = sentBundle.entry[0].resource
+    expect(patient.link).toContainEqual({
+      other: { reference: `Patient/${GOLDEN_RECORD_ID}` },
+      type: 'refer',
+    })
+
+    // AllergyIntolerance.patient should be rewritten to golden record
+    const allergy = sentBundle.entry[1].resource
+    expect(allergy.patient.reference).toBe(`Patient/${GOLDEN_RECORD_ID}`)
+
+    // Observation.subject should be rewritten to golden record
+    const obs = sentBundle.entry[2].resource
+    expect(obs.subject.reference).toBe(`Patient/${GOLDEN_RECORD_ID}`)
+  })
+
+  it('rewrites nested patient references via recursive traversal', async () => {
+    mockGotGet.mockReturnValue({
+      json: () => Promise.resolve(crResponseWithSources),
+    })
+
+    mockGotPut.mockResolvedValue({ statusCode: 200, body: '{}' })
+
+    mockGotPost.mockResolvedValue({
+      statusCode: 200,
+      body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
+    })
+
+    const bundle = {
+      resourceType: 'Bundle',
+      type: 'transaction',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Patient',
+            id: 'pt-nested',
+            identifier: [{ system: 'http://isanteplus.org/openmrs/fhir2/5-code-national', value: '99999' }],
+          },
+          request: { method: 'PUT', url: 'Patient/pt-nested' },
+        },
+        {
+          resource: {
+            resourceType: 'Encounter',
+            id: 'enc-1',
+            subject: { reference: 'Patient/pt-nested' },
+            participant: [
+              {
+                individual: { reference: 'Practitioner/prac-1' },
+              },
+            ],
+            serviceProvider: { reference: 'Organization/org-1' },
+          },
+          request: { method: 'PUT', url: 'Encounter/enc-1' },
+        },
+      ],
+    }
+
+    const response = await request(app).post('/').send(bundle)
+    expect(response.status).toBe(200)
+
+    const sentBundle = mockGotPost.mock.calls[0][1].json
+    const encounter = sentBundle.entry[1].resource
+
+    // subject should be rewritten
+    expect(encounter.subject.reference).toBe(`Patient/${GOLDEN_RECORD_ID}`)
+    // Practitioner reference should NOT be rewritten (not a Patient ref)
+    expect(encounter.participant[0].individual.reference).toBe('Practitioner/prac-1')
+  })
+
+  it('does not rewrite references when no golden record is found', async () => {
+    mockGotGet.mockReturnValue({
+      json: () => Promise.resolve(crResponseNoMatch),
+    })
+
+    mockGotPost.mockResolvedValue({
+      statusCode: 200,
+      body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
+    })
+
+    const bundle = {
+      resourceType: 'Bundle',
+      type: 'transaction',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Patient',
+            id: 'pt-no-match',
+            identifier: [{ system: 'http://isanteplus.org/openmrs/fhir2/5-code-national', value: '00000' }],
+          },
+          request: { method: 'PUT', url: 'Patient/pt-no-match' },
+        },
+        {
+          resource: {
+            resourceType: 'AllergyIntolerance',
+            id: 'allergy-2',
+            patient: { reference: 'Patient/pt-no-match' },
+          },
+          request: { method: 'PUT', url: 'AllergyIntolerance/allergy-2' },
+        },
+      ],
+    }
+
+    const response = await request(app).post('/').send(bundle)
+    expect(response.status).toBe(200)
+
+    const sentBundle = mockGotPost.mock.calls[0][1].json
+    const allergy = sentBundle.entry[1].resource
+
+    // Reference should be unchanged
+    expect(allergy.patient.reference).toBe('Patient/pt-no-match')
+  })
+})
+
+describe('Golden Record Demographics Resolution', () => {
+  afterEach(() => {
+    mockGotGet.mockReset()
+    mockGotPost.mockReset()
+    mockGotPut.mockReset()
+    mockGotDefault.mockReset()
+  })
+
+  it('updates golden record Patient in SHR with official name from CR sources', async () => {
+    const crResponseWithMultipleNames = {
+      resourceType: 'Bundle',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Patient',
+            id: 'source-1',
+            name: [{ use: 'official', family: 'DOE', given: ['JOHN'] }],
+            gender: 'male',
+            birthDate: '1985',
+            meta: { tag: [{ code: 'facility-a' }], lastUpdated: '2026-04-09T10:00:00Z' },
+            identifier: [{ system: 'http://isanteplus.org/openmrs/fhir2/3-isanteplus-id', value: 'AAA' }],
+          },
+        },
+        {
+          resource: {
+            resourceType: 'Patient',
+            id: 'source-2',
+            name: [{ use: 'official', family: 'KUNTA', given: ['SMITH'] }],
+            gender: 'male',
+            birthDate: '1985',
+            meta: { tag: [{ code: 'facility-b' }], lastUpdated: '2026-04-10T12:00:00Z' },
+            identifier: [{ system: 'http://isanteplus.org/openmrs/fhir2/3-isanteplus-id', value: 'BBB' }],
+          },
+        },
+        {
+          resource: {
+            resourceType: 'Patient',
+            id: GOLDEN_RECORD_ID,
+            meta: { tag: [{ code: GOLDEN_RECORD_CODE }] },
+          },
+        },
+      ],
+    }
+
+    mockGotGet.mockReturnValue({
+      json: () => Promise.resolve(crResponseWithMultipleNames),
+    })
+
+    mockGotPut.mockResolvedValue({ statusCode: 200, body: '{}' })
+
+    mockGotPost.mockResolvedValue({
+      statusCode: 200,
+      body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
+    })
+
+    const bundle = {
+      resourceType: 'Bundle',
+      type: 'transaction',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Patient',
+            id: 'pt-test',
+            identifier: [{ system: 'http://isanteplus.org/openmrs/fhir2/3-isanteplus-id', value: 'AAA' }],
+          },
+          request: { method: 'PUT', url: 'Patient/pt-test' },
+        },
+      ],
+    }
+
+    await request(app).post('/').send(bundle)
+
+    // Wait briefly for background golden record update
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    // Verify golden record PUT was called
+    expect(mockGotPut).toHaveBeenCalled()
+    const putCall = mockGotPut.mock.calls[0]
+    expect(putCall[0]).toContain(`Patient/${GOLDEN_RECORD_ID}`)
+
+    const goldenPatient = putCall[1].json
+
+    // Should have the official name from the MOST RECENT source (source-2, updated later)
+    expect(goldenPatient.name[0].use).toBe('official')
+    expect(goldenPatient.name[0].family).toBe('KUNTA')
+    expect(goldenPatient.name[0].given).toEqual(['SMITH'])
+
+    // Should also include the other name
+    expect(goldenPatient.name.length).toBe(2)
+
+    // Identifiers should be merged from both sources
+    expect(goldenPatient.identifier.length).toBe(2)
+    expect(goldenPatient.identifier.map((i: any) => i.value).sort()).toEqual(['AAA', 'BBB'])
   })
 })
 
