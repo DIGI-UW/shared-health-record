@@ -232,6 +232,203 @@ export async function generateSimpleIpsBundle(patientId: string): Promise<R4.IBu
   return ipsBundle
 }
 
+/**
+ * Generate an IPS bundle that aggregates clinical data across multiple patients
+ * that share the same golden record. This enables cross-facility patient summaries.
+ *
+ * @param patientIds - Array of patient IDs linked to the same golden record
+ */
+export async function generateCrossFacilityIpsBundle(patientIds: string[]): Promise<R4.IBundle> {
+  const ipsBundle: R4.IBundle = {
+    resourceType: 'Bundle',
+  }
+
+  const ipsCompositionType: R4.ICodeableConcept = {
+    coding: [
+      {
+        system: 'http://loinc.org',
+        code: '60591-5',
+        display: 'Patient summary Document',
+      },
+    ],
+  }
+
+  try {
+    const fhirBase = config.get('fhirServer:baseURL')
+    const options = {
+      username: config.get('fhirServer:username'),
+      password: config.get('fhirServer:password'),
+    }
+
+    const ipsSections: any = {
+      Patient: [],
+      Encounter: [],
+      ServiceRequest: [],
+      DiagnosticReport: [],
+      Observation: [],
+      AllergyIntolerance: [],
+      Condition: [],
+      MedicationRequest: [],
+      MedicationStatement: [],
+      Immunization: [],
+      Procedure: [],
+    }
+
+    // Track seen resource IDs per type to deduplicate in O(1) per entry
+    const seenIds: Record<string, Set<string>> = {}
+
+    // Fetch data for each linked patient with bounded parallelism and merge into sections
+    const IPS_FETCH_CONCURRENCY = 4
+
+    const processBundleEntries = (searchBundle: R4.IBundle) => {
+      if (searchBundle && searchBundle.entry && searchBundle.entry.length > 0) {
+        for (const e of searchBundle.entry) {
+          if (e.resource && e.resource.id) {
+            const resourceKey = String(e.resource.resourceType)
+
+            if (!ipsSections[resourceKey]) {
+              ipsSections[resourceKey] = []
+            }
+            if (!seenIds[resourceKey]) {
+              seenIds[resourceKey] = new Set()
+            }
+
+            // Deduplicate by resource ID using Set for O(1) lookup
+            if (!seenIds[resourceKey].has(e.resource.id)) {
+              seenIds[resourceKey].add(e.resource.id)
+              ipsSections[resourceKey].push(e.resource)
+            }
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < patientIds.length; i += IPS_FETCH_CONCURRENCY) {
+      const batch = patientIds.slice(i, i + IPS_FETCH_CONCURRENCY)
+      const results = await Promise.all(
+        batch.map(async (pid) => {
+          try {
+            return <R4.IBundle>await got
+              .get(`${fhirBase}/Patient?_id=${encodeURIComponent(pid)}&_include=*&_revinclude=*`, options)
+              .json()
+          } catch (err: any) {
+            logger.warn(`Failed to fetch data for Patient/${pid}: ${err.message}`)
+            return null
+          }
+        }),
+      )
+      for (const result of results) {
+        if (result) processBundleEntries(result)
+      }
+    }
+
+    // Prefer the golden record Patient as the primary subject (it has "seealso" links to sources).
+    // Fall back to the first patient with demographics if no golden record is found.
+    const primaryPatient = ipsSections['Patient'].find((p: any) =>
+      p.link && p.link.some((l: any) => l.type === 'seealso')
+    ) || ipsSections['Patient'].find((p: any) => p.name && p.name.length > 0)
+      || ipsSections['Patient'][0]
+
+    if (primaryPatient) {
+      const ipsComposition: R4.IComposition = {
+        resourceType: 'Composition',
+        type: ipsCompositionType,
+        author: [{ display: 'SHR System' }],
+        subject: { reference: `Patient/${primaryPatient.id}` },
+        section: [
+          {
+            title: 'Patient Records',
+            entry: ipsSections['Patient'].map((p: R4.IPatient) => {
+              return { reference: `Patient/${p.id!}` }
+            }),
+          },
+          {
+            title: 'Allergies and Intolerances',
+            entry: ipsSections['AllergyIntolerance'].map((a: any) => {
+              return { reference: `AllergyIntolerance/${a.id}` }
+            }),
+          },
+          {
+            title: 'Problem List',
+            entry: ipsSections['Condition'].map((c: any) => {
+              return { reference: `Condition/${c.id}` }
+            }),
+          },
+          {
+            title: 'Medication Summary',
+            entry: [
+              ...ipsSections['MedicationRequest'].map((m: any) => {
+                return { reference: `MedicationRequest/${m.id}` }
+              }),
+              ...ipsSections['MedicationStatement'].map((m: any) => {
+                return { reference: `MedicationStatement/${m.id}` }
+              }),
+            ],
+          },
+          {
+            title: 'Encounters',
+            entry: ipsSections['Encounter'].map((e: R4.IEncounter) => {
+              return { reference: `Encounter/${e.id!}` }
+            }),
+          },
+          {
+            title: 'Service Requests',
+            entry: ipsSections['ServiceRequest'].map((sr: any) => {
+              return { reference: `ServiceRequest/${sr.id}` }
+            }),
+          },
+          {
+            title: 'Diagnostic Reports',
+            entry: ipsSections['DiagnosticReport'].map((dr: any) => {
+              return { reference: `DiagnosticReport/${dr.id}` }
+            }),
+          },
+          {
+            title: 'Observations',
+            entry: ipsSections['Observation'].map((o: R4.IObservation) => {
+              return { reference: `Observation/${o.id!}` }
+            }),
+          },
+          {
+            title: 'Immunizations',
+            entry: ipsSections['Immunization'].map((i: any) => {
+              return { reference: `Immunization/${i.id}` }
+            }),
+          },
+          {
+            title: 'Procedures',
+            entry: ipsSections['Procedure'].map((p: any) => {
+              return { reference: `Procedure/${p.id}` }
+            }),
+          },
+        ],
+      }
+
+      ipsBundle.type = R4.BundleTypeKind._document
+      ipsBundle.entry = []
+      ipsBundle.entry.push(ipsComposition)
+
+      // Add all resources to the bundle
+      const bundleTypes = [
+        'Patient', 'AllergyIntolerance', 'Condition', 'MedicationRequest',
+        'MedicationStatement', 'Encounter', 'ServiceRequest', 'DiagnosticReport',
+        'Observation', 'Immunization', 'Procedure',
+      ]
+      for (const rt of bundleTypes) {
+        if (ipsSections[rt] && ipsSections[rt].length > 0 && ipsBundle.entry) {
+          ipsBundle.entry = ipsBundle.entry.concat(ipsSections[rt])
+        }
+      }
+    } else {
+      logger.error(`Cannot generate cross-facility IPS: no patients found for IDs ${patientIds.join(', ')}`)
+    }
+  } catch (e) {
+    logger.error(`Cannot generate cross-facility IPS for patients ${patientIds.join(', ')}:\n${e}`)
+  }
+
+  return ipsBundle
+}
+
 export function generateUpdateBundle(
   values: R4.IDomainResource[][],
   lastUpdated?: string,
