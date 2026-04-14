@@ -43,8 +43,6 @@ jobs:
         run: yarn test:unit
 
   build-and-deploy:
-    # Skip Docker build/push for PRs from forks (repo secrets not available)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 10
     runs-on: ubuntu-latest
 
@@ -81,8 +79,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' }}
+          push: true
+          load: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{github.repository}}:latest
