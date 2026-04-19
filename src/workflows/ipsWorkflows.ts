@@ -238,7 +238,10 @@ export async function generateSimpleIpsBundle(patientId: string): Promise<R4.IBu
  *
  * @param patientIds - Array of patient IDs linked to the same golden record
  */
-export async function generateCrossFacilityIpsBundle(patientIds: string[]): Promise<R4.IBundle> {
+export async function generateCrossFacilityIpsBundle(
+  patientIds: string[],
+  goldenRecordId?: string | null,
+): Promise<R4.IBundle> {
   const ipsBundle: R4.IBundle = {
     resourceType: 'Bundle',
   }
@@ -303,28 +306,38 @@ export async function generateCrossFacilityIpsBundle(patientIds: string[]): Prom
       }
     }
 
+    const SEARCH_COUNT = 200
     for (let i = 0; i < patientIds.length; i += IPS_FETCH_CONCURRENCY) {
       const batch = patientIds.slice(i, i + IPS_FETCH_CONCURRENCY)
-      const results = await Promise.all(
+      await Promise.all(
         batch.map(async (pid) => {
+          let nextUrl: string | null = `${fhirBase}/Patient?_id=${encodeURIComponent(pid)}&_include=*&_revinclude=*&_count=${SEARCH_COUNT}`
           try {
-            return <R4.IBundle>await got
-              .get(`${fhirBase}/Patient?_id=${encodeURIComponent(pid)}&_include=*&_revinclude=*`, options)
-              .json()
+            while (nextUrl) {
+              const searchBundle = <R4.IBundle>await got.get(nextUrl, options).json()
+              processBundleEntries(searchBundle)
+              const nextLink = searchBundle.link
+                ? searchBundle.link.find(
+                    (link: NonNullable<R4.IBundle['link']>[number]) => link.relation === 'next' && link.url,
+                  )
+                : undefined
+              nextUrl = nextLink?.url || null
+            }
           } catch (err: any) {
             logger.warn(`Failed to fetch data for Patient/${pid}: ${err.message}`)
-            return null
+            return
           }
         }),
       )
-      for (const result of results) {
-        if (result) processBundleEntries(result)
-      }
     }
 
-    // Prefer the golden record Patient as the primary subject (it has "seealso" links to sources).
-    // Fall back to the first patient with demographics if no golden record is found.
-    const primaryPatient = ipsSections['Patient'].find((p: any) =>
+    const primaryPatientById = goldenRecordId
+      ? ipsSections['Patient'].find((p: R4.IPatient) => p.id === goldenRecordId)
+      : null
+
+    // Prefer the golden record Patient as the primary subject.
+    // Fall back to "seealso", then first patient with demographics, then first patient.
+    const primaryPatient = primaryPatientById || ipsSections['Patient'].find((p: any) =>
       p.link && p.link.some((l: any) => l.type === 'seealso')
     ) || ipsSections['Patient'].find((p: any) => p.name && p.name.length > 0)
       || ipsSections['Patient'][0]

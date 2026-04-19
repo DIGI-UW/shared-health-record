@@ -39,6 +39,13 @@ jest.mock('../../lib/config', () => ({
 const GOLDEN_RECORD_ID = 'b8115fb4-ea19-4578-bc50-05d4a17ca0c7'
 const GOLDEN_RECORD_CODE = '5c827da5-4858-4f3d-a50c-62ece001efea'
 
+beforeEach(() => {
+  mockGotGet.mockReset()
+  mockGotPost.mockReset()
+  mockGotPut.mockReset()
+  mockGotDefault.mockReset()
+})
+
 const crResponseWithGoldenRecord = {
   resourceType: 'Bundle',
   entry: [
@@ -183,6 +190,29 @@ describe('MPI Resolution via saveResource (POST /Patient, PUT /Patient/:id)', ()
     // Patient saved without a link
     const hapiCall = mockGotDefault.mock.calls[0][0]
     expect(hapiCall.json.link).toBeUndefined()
+  })
+
+  it('POST /Patient without id does not schedule golden record update with undefined id', async () => {
+    mockGotGet.mockReturnValue({
+      json: () => Promise.resolve(crResponseWithGoldenRecord),
+    })
+    mockGotPut.mockResolvedValue({ statusCode: 200, body: '{}' })
+    mockGotDefault.mockResolvedValue({
+      statusCode: 201,
+      body: JSON.stringify({ resourceType: 'Patient', id: 'created-id' }),
+    })
+
+    const patientWithoutId = {
+      resourceType: 'Patient',
+      name: [{ family: 'Baptiste', given: ['Jean'] }],
+      identifier: [
+        { system: 'http://isanteplus.org/openmrs/fhir2/5-code-national', value: '99999' },
+      ],
+    }
+
+    const response = await request(app).post('/Patient').send(patientWithoutId)
+    expect(response.status).toBe(201)
+    expect(mockGotPut).not.toHaveBeenCalled()
   })
 
   it('POST /Observation skips MPI resolution', async () => {
@@ -611,6 +641,50 @@ describe('Reference Rewriting on Bundle Write Path', () => {
     expect(encounter.participant[0].individual.reference).toBe('Practitioner/prac-1')
   })
 
+  it('rewrites references using patient fullUrl when Patient.id is missing', async () => {
+    mockGotGet.mockReturnValue({
+      json: () => Promise.resolve(crResponseWithSources),
+    })
+
+    mockGotPut.mockResolvedValue({ statusCode: 200, body: '{}' })
+
+    mockGotPost.mockResolvedValue({
+      statusCode: 200,
+      body: JSON.stringify({ resourceType: 'Bundle', type: 'transaction-response' }),
+    })
+
+    const bundle = {
+      resourceType: 'Bundle',
+      type: 'transaction',
+      entry: [
+        {
+          fullUrl: 'urn:uuid:patient-1',
+          resource: {
+            resourceType: 'Patient',
+            identifier: [{ system: 'http://isanteplus.org/openmrs/fhir2/5-code-national', value: '45678' }],
+          },
+          request: { method: 'POST', url: 'Patient' },
+        },
+        {
+          resource: {
+            resourceType: 'Observation',
+            id: 'obs-urn-1',
+            subject: { reference: 'urn:uuid:patient-1' },
+            status: 'final',
+          },
+          request: { method: 'PUT', url: 'Observation/obs-urn-1' },
+        },
+      ],
+    }
+
+    const response = await request(app).post('/').send(bundle)
+    expect(response.status).toBe(200)
+
+    const sentBundle = mockGotPost.mock.calls[0][1].json
+    const obs = sentBundle.entry[1].resource
+    expect(obs.subject.reference).toBe(`Patient/${GOLDEN_RECORD_ID}`)
+  })
+
   it('does not rewrite references when no golden record is found', async () => {
     mockGotGet.mockReturnValue({
       json: () => Promise.resolve(crResponseNoMatch),
@@ -727,11 +801,9 @@ describe('Golden Record Demographics Resolution', () => {
 
     await request(app).post('/').send(bundle)
 
-    // Wait briefly for background golden record update
-    await new Promise(resolve => setTimeout(resolve, 100))
-
     // Verify golden record PUT was called
     expect(mockGotPut).toHaveBeenCalled()
+    await mockGotPut.mock.results[0].value
     const putCall = mockGotPut.mock.calls[0]
     expect(putCall[0]).toContain(`Patient/${GOLDEN_RECORD_ID}`)
 
