@@ -48,11 +48,11 @@ const SECTION_CODES: Record<string, { system: string; code: string; display: str
   'Allergies and Intolerances': { system: 'http://loinc.org', code: '48765-2', display: 'Allergies and adverse reactions Document' },
   'Problem List': { system: 'http://loinc.org', code: '11450-4', display: 'Problem list - Reported' },
   'Medication Summary': { system: 'http://loinc.org', code: '10160-0', display: 'History of Medication use Narrative' },
-  'Encounters': { system: 'http://loinc.org', code: '46240-8', display: 'History of encounters Document' },
+  'Encounters': { system: 'http://loinc.org', code: '46240-8', display: 'History of Hospitalizations+Outpatient visits Narrative' },
   'Service Requests': { system: LOCAL_SECTION_SYSTEM, code: 'service-requests', display: 'Service Requests' },
-  'Diagnostic Reports': { system: 'http://loinc.org', code: '30954-2', display: 'Relevant diagnostic tests/laboratory data Narrative' },
+  'Diagnostic Reports': { system: 'http://loinc.org', code: '30954-2', display: 'Relevant diagnostic tests/laboratory data note' },
   'Observations': { system: LOCAL_SECTION_SYSTEM, code: 'observations', display: 'Observations' },
-  'Immunizations': { system: 'http://loinc.org', code: '11369-6', display: 'History of Immunization Narrative' },
+  'Immunizations': { system: 'http://loinc.org', code: '11369-6', display: 'History of Immunization note' },
   'Procedures': { system: 'http://loinc.org', code: '47519-4', display: 'History of Procedures Document' },
 }
 
