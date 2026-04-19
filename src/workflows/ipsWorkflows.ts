@@ -77,11 +77,32 @@ function escapeXml(input: string): string {
   }[c] as string))
 }
 
+function buildLocalSectionCode(title: string): string {
+  const slug = title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  return slug || 'section'
+}
+
 function buildIpsSection(title: string, entries: R4.IReference[]): R4.IComposition_Section {
   const coded = SECTION_CODES[title]
-  const code: R4.ICodeableConcept = coded
-    ? { coding: [{ system: coded.system, code: coded.code, display: coded.display }], text: title }
-    : { text: title }
+  const sectionCoding = coded
+    ? { system: coded.system, code: coded.code, display: coded.display }
+    : { system: LOCAL_SECTION_SYSTEM, code: buildLocalSectionCode(title), display: title }
+
+  if (!coded) {
+    logger.warn(
+      `Missing IPS section code mapping for title "${title}", using deterministic local code "${sectionCoding.code}"`,
+    )
+  }
+
+  const code: R4.ICodeableConcept = {
+    coding: [sectionCoding],
+    text: title,
+  }
 
   const safeTitle = escapeXml(title)
   const hasEntries = entries.length > 0
