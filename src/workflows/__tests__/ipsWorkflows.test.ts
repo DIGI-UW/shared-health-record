@@ -21,6 +21,17 @@ jest.mock('../../lib/config', () => ({
   },
 }))
 
+// Silence winston output for error paths exercised by these tests
+jest.mock('../../lib/winston', () => ({
+  __esModule: true,
+  default: {
+    error: jest.fn(),
+    info: jest.fn(),
+    warn: jest.fn(),
+    debug: jest.fn(),
+  },
+}))
+
 beforeEach(() => {
   mockGotGet.mockReset()
 })
@@ -200,10 +211,10 @@ describe('generateSimpleIpsBundle', () => {
   })
 
   // BUG: generateSimpleIpsBundle initializes ipsSections with 'DiagnosticResult' (typo)
-  // but then tries to map ipsSections['DiagnosticReport'] which is undefined, causing
-  // the Composition creation to throw and the function to return an empty bundle.
-  // This test documents the bug. See issue #132.
-  it('returns empty bundle due to DiagnosticResult/DiagnosticReport typo bug', async () => {
+  // but later maps ipsSections['DiagnosticReport']. When no DiagnosticReport resources
+  // are returned, that key is never created, Composition creation throws, and the
+  // function returns an empty bundle. This test documents the current behavior. See issue #132.
+  it('returns empty bundle when no DiagnosticReport resources are returned due to DiagnosticResult/DiagnosticReport typo bug', async () => {
     mockGotGet.mockReturnValueOnce({
       json: () => Promise.resolve(makeFhirSearchResponse([patient1, encounter1, observation1])),
     })
@@ -292,8 +303,8 @@ describe('generateSimpleIpsBundle', () => {
     expect(result.entry).toBeUndefined()
   })
 
-  // Also affected by the DiagnosticResult typo bug — cannot generate IPS
-  it('also returns empty bundle with patient + encounter due to same bug', async () => {
+  // Returns an empty bundle for this patient + encounter-only search result
+  it('returns empty bundle with patient + encounter only', async () => {
     mockGotGet.mockReturnValueOnce({
       json: () => Promise.resolve(makeFhirSearchResponse([patient1, encounter1])),
     })
