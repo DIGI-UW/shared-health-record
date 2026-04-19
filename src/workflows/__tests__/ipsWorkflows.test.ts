@@ -1,7 +1,7 @@
-import { generateIpsbundle, generateSimpleIpsBundle } from '../ipsWorkflows'
+import { generateIpsbundle, generateCrossFacilityIpsBundle } from '../ipsWorkflows'
 import { R4 } from '@ahryman40k/ts-fhir-types'
 
-// Mock got for generateSimpleIpsBundle
+// Mock got for generateCrossFacilityIpsBundle
 const mockGotGet = jest.fn()
 jest.mock('got', () => {
   const fn = (...args: any[]) => mockGotGet(...args)
@@ -201,118 +201,188 @@ describe('generateIpsbundle', () => {
   })
 })
 
-// --- generateSimpleIpsBundle ---
+// --- generateCrossFacilityIpsBundle ---
 
-describe('generateSimpleIpsBundle', () => {
-  const makeFhirSearchResponse = (entries: any[]) => ({
-    resourceType: 'Bundle',
-    type: 'searchset',
-    entry: entries.map(r => ({ resource: r })),
-  })
+describe('generateCrossFacilityIpsBundle', () => {
+  const makeFhirSearchResponse = (entries: any[], nextUrl?: string): R4.IBundle => {
+    const bundle: R4.IBundle = {
+      resourceType: 'Bundle',
+      type: R4.BundleTypeKind._searchset,
+      entry: entries.map(r => ({ resource: r })),
+    }
+    if (nextUrl) {
+      bundle.link = [{ relation: 'next', url: nextUrl }]
+    }
+    return bundle
+  }
 
-  // BUG: generateSimpleIpsBundle initializes ipsSections with 'DiagnosticResult' (typo)
-  // but later maps ipsSections['DiagnosticReport']. When no DiagnosticReport resources
-  // are returned, that key is never created, Composition creation throws, and the
-  // function returns an empty bundle. This test documents the current behavior; the
-  // typo is fixed as part of the rewrite in PR #131.
-  it('returns empty bundle when no DiagnosticReport resources are returned due to DiagnosticResult/DiagnosticReport typo bug', async () => {
-    mockGotGet.mockReturnValueOnce({
-      json: () => Promise.resolve(makeFhirSearchResponse([patient1, encounter1, observation1])),
-    })
-
-    const result = await generateSimpleIpsBundle('pt-001')
-
-    expect(result.resourceType).toBe('Bundle')
-    // Bug causes entry to be undefined instead of populated
-    expect(result.entry).toBeUndefined()
-  })
-
-  it('queries HAPI FHIR with _id, _include, and _revinclude', async () => {
+  it('queries HAPI FHIR with _id, _include, _revinclude, and _count', async () => {
     mockGotGet.mockReturnValueOnce({
       json: () => Promise.resolve(makeFhirSearchResponse([patient1])),
     })
 
-    await generateSimpleIpsBundle('pt-001')
+    await generateCrossFacilityIpsBundle(['pt-001'])
 
     expect(mockGotGet).toHaveBeenCalledTimes(1)
     const url = mockGotGet.mock.calls[0][0]
     expect(url).toContain('Patient?_id=pt-001')
     expect(url).toContain('_include=*')
     expect(url).toContain('_revinclude=*')
+    expect(url).toContain('_count=200')
   })
 
-  it('groups resources by type into correct sections', async () => {
+  it('groups resources by type into correct sections (including DiagnosticReport)', async () => {
     const serviceRequest = { resourceType: 'ServiceRequest', id: 'sr-001' }
     const diagnosticReport = { resourceType: 'DiagnosticReport', id: 'dr-001' }
+    const allergy = { resourceType: 'AllergyIntolerance', id: 'al-001' }
+    const condition = { resourceType: 'Condition', id: 'cd-001' }
+    const medRequest = { resourceType: 'MedicationRequest', id: 'mr-001' }
 
     mockGotGet.mockReturnValueOnce({
       json: () => Promise.resolve(makeFhirSearchResponse([
         patient1, encounter1, observation1, serviceRequest, diagnosticReport,
+        allergy, condition, medRequest,
       ])),
     })
 
-    const result = await generateSimpleIpsBundle('pt-001')
+    const result = await generateCrossFacilityIpsBundle(['pt-001'])
 
     const composition = result.entry![0] as R4.IComposition
-    const encounterSection = composition.section!.find(s => s.title === 'Encounters')
-    expect(encounterSection!.entry).toHaveLength(1)
-    expect(encounterSection!.entry![0].reference).toBe('Encounter/enc-001')
-
-    const srSection = composition.section!.find(s => s.title === 'Service Requests')
-    expect(srSection!.entry).toHaveLength(1)
-
-    const drSection = composition.section!.find(s => s.title === 'Diagnostic Reports')
-    expect(drSection!.entry).toHaveLength(1)
-
-    const obsSection = composition.section!.find(s => s.title === 'Observations')
-    expect(obsSection!.entry).toHaveLength(1)
+    const sectionBy = (title: string) => composition.section!.find(s => s.title === title)
+    expect(sectionBy('Encounters')!.entry![0].reference).toBe('Encounter/enc-001')
+    expect(sectionBy('Service Requests')!.entry![0].reference).toBe('ServiceRequest/sr-001')
+    // Typo fix verification — DiagnosticReport key now populated correctly
+    expect(sectionBy('Diagnostic Reports')!.entry![0].reference).toBe('DiagnosticReport/dr-001')
+    expect(sectionBy('Observations')!.entry![0].reference).toBe('Observation/obs-001')
+    expect(sectionBy('Allergies and Intolerances')!.entry![0].reference).toBe('AllergyIntolerance/al-001')
+    expect(sectionBy('Problem List')!.entry![0].reference).toBe('Condition/cd-001')
+    expect(sectionBy('Medication Summary')!.entry![0].reference).toBe('MedicationRequest/mr-001')
   })
 
-  it('returns empty bundle when patient not found', async () => {
+  it('populates a Diagnostic Reports section even when no DiagnosticReport resources are returned', async () => {
+    // Regression guard for the old DiagnosticResult/DiagnosticReport typo: the
+    // rewritten function must not throw when no DiagnosticReport resources come back.
+    mockGotGet.mockReturnValueOnce({
+      json: () => Promise.resolve(makeFhirSearchResponse([patient1, encounter1, observation1])),
+    })
+
+    const result = await generateCrossFacilityIpsBundle(['pt-001'])
+
+    expect(result.entry).toBeDefined()
+    const composition = result.entry![0] as R4.IComposition
+    const drSection = composition.section!.find(s => s.title === 'Diagnostic Reports')
+    expect(drSection).toBeDefined()
+    expect(drSection!.entry).toHaveLength(0)
+  })
+
+  it('returns empty bundle when no patients are returned', async () => {
     mockGotGet.mockReturnValueOnce({
       json: () => Promise.resolve(makeFhirSearchResponse([])),
     })
 
-    const result = await generateSimpleIpsBundle('pt-nonexistent')
+    const result = await generateCrossFacilityIpsBundle(['pt-nonexistent'])
 
     expect(result.resourceType).toBe('Bundle')
-    // No Composition generated because no patient found
+    // No primaryPatient, so no Composition is produced
     expect(result.entry).toBeUndefined()
   })
 
-  it('returns empty bundle on HAPI FHIR error', async () => {
+  it('returns empty bundle when the HAPI request fails', async () => {
     mockGotGet.mockReturnValueOnce({
       json: () => Promise.reject(new Error('connection refused')),
     })
 
-    const result = await generateSimpleIpsBundle('pt-001')
+    const result = await generateCrossFacilityIpsBundle(['pt-001'])
 
     expect(result.resourceType).toBe('Bundle')
     expect(result.entry).toBeUndefined()
   })
 
-  it('only generates IPS when exactly one patient is returned', async () => {
-    // When _revinclude returns multiple patients (linked via references),
-    // generateSimpleIpsBundle expects exactly 1 patient
-    mockGotGet.mockReturnValueOnce({
-      json: () => Promise.resolve(makeFhirSearchResponse([patient1, patient2])),
-    })
+  it('aggregates resources across multiple linked patient IDs', async () => {
+    const observation2: R4.IObservation = {
+      resourceType: 'Observation',
+      id: 'obs-002',
+      status: R4.ObservationStatusKind._final,
+      code: { text: 'Heart Rate' },
+    }
 
-    const result = await generateSimpleIpsBundle('pt-001')
+    mockGotGet.mockImplementation((url: string) => ({
+      json: () => {
+        if (url.includes('_id=pt-001')) {
+          return Promise.resolve(makeFhirSearchResponse([patient1, observation1]))
+        }
+        if (url.includes('_id=pt-002')) {
+          return Promise.resolve(makeFhirSearchResponse([patient2, observation2]))
+        }
+        return Promise.resolve(makeFhirSearchResponse([]))
+      },
+    }))
 
-    // With 2 patients, it logs error and returns empty bundle
-    expect(result.entry).toBeUndefined()
+    const result = await generateCrossFacilityIpsBundle(['pt-001', 'pt-002'])
+
+    expect(mockGotGet).toHaveBeenCalledTimes(2)
+    const composition = result.entry![0] as R4.IComposition
+    const patientSection = composition.section!.find(s => s.title === 'Patient Records')
+    const obsSection = composition.section!.find(s => s.title === 'Observations')
+    expect(patientSection!.entry).toHaveLength(2)
+    expect(obsSection!.entry).toHaveLength(2)
   })
 
-  // Returns an empty bundle for this patient + encounter-only search result
-  it('returns empty bundle with patient + encounter only', async () => {
+  it('deduplicates resources that appear in results for multiple patient IDs', async () => {
+    // Same observation returned for both patient fetches — should appear once.
+    mockGotGet.mockImplementation((url: string) => ({
+      json: () => {
+        if (url.includes('_id=pt-001')) {
+          return Promise.resolve(makeFhirSearchResponse([patient1, observation1]))
+        }
+        if (url.includes('_id=pt-002')) {
+          return Promise.resolve(makeFhirSearchResponse([patient2, observation1]))
+        }
+        return Promise.resolve(makeFhirSearchResponse([]))
+      },
+    }))
+
+    const result = await generateCrossFacilityIpsBundle(['pt-001', 'pt-002'])
+
+    const composition = result.entry![0] as R4.IComposition
+    const obsSection = composition.section!.find(s => s.title === 'Observations')
+    expect(obsSection!.entry).toHaveLength(1)
+    expect(obsSection!.entry![0].reference).toBe('Observation/obs-001')
+  })
+
+  it('uses the golden record patient as Composition.subject when provided', async () => {
+    const goldenPatient: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'gr-001',
+      name: [{ family: 'Golden', given: ['Record'] }],
+    }
+
     mockGotGet.mockReturnValueOnce({
-      json: () => Promise.resolve(makeFhirSearchResponse([patient1, encounter1])),
+      json: () => Promise.resolve(makeFhirSearchResponse([patient1, goldenPatient, observation1])),
     })
 
-    const result = await generateSimpleIpsBundle('pt-001')
+    const result = await generateCrossFacilityIpsBundle(['pt-001'], 'gr-001')
 
-    expect(result.resourceType).toBe('Bundle')
-    expect(result.entry).toBeUndefined()
+    const composition = result.entry![0] as R4.IComposition
+    expect(composition.subject!.reference).toBe('Patient/gr-001')
+  })
+
+  it('follows pagination via the bundle "next" link', async () => {
+    const nextPageUrl = 'http://hapi-fhir:8080/fhir?_getpages=xyz&_count=200'
+    mockGotGet
+      .mockReturnValueOnce({
+        json: () => Promise.resolve(makeFhirSearchResponse([patient1], nextPageUrl)),
+      })
+      .mockReturnValueOnce({
+        json: () => Promise.resolve(makeFhirSearchResponse([observation1])),
+      })
+
+    const result = await generateCrossFacilityIpsBundle(['pt-001'])
+
+    expect(mockGotGet).toHaveBeenCalledTimes(2)
+    expect(mockGotGet.mock.calls[1][0]).toBe(nextPageUrl)
+    const composition = result.entry![0] as R4.IComposition
+    const obsSection = composition.section!.find(s => s.title === 'Observations')
+    expect(obsSection!.entry).toHaveLength(1)
   })
 })
