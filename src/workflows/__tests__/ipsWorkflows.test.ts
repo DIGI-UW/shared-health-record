@@ -213,7 +213,8 @@ describe('generateSimpleIpsBundle', () => {
   // BUG: generateSimpleIpsBundle initializes ipsSections with 'DiagnosticResult' (typo)
   // but later maps ipsSections['DiagnosticReport']. When no DiagnosticReport resources
   // are returned, that key is never created, Composition creation throws, and the
-  // function returns an empty bundle. This test documents the current behavior. See issue #132.
+  // function returns an empty bundle. This test documents the current behavior; the
+  // typo is fixed as part of the rewrite in PR #131.
   it('returns empty bundle when no DiagnosticReport resources are returned due to DiagnosticResult/DiagnosticReport typo bug', async () => {
     mockGotGet.mockReturnValueOnce({
       json: () => Promise.resolve(makeFhirSearchResponse([patient1, encounter1, observation1])),
