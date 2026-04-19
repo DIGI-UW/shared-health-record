@@ -386,3 +386,130 @@ describe('generateCrossFacilityIpsBundle', () => {
     expect(obsSection!.entry).toHaveLength(1)
   })
 })
+
+// --- IPS Composition profile conformance ---
+
+describe('IPS Composition required fields (issue #132)', () => {
+  const makeFhirSearchResponse = (entries: any[]): R4.IBundle => ({
+    resourceType: 'Bundle',
+    type: R4.BundleTypeKind._searchset,
+    entry: entries.map(r => ({ resource: r })),
+  })
+
+  const assertCompositionMetadata = (composition: R4.IComposition) => {
+    expect(composition.status).toBe(R4.CompositionStatusKind._final)
+    expect(composition.title).toBe('International Patient Summary')
+    expect(composition.date).toBeDefined()
+    // date must be a valid ISO-8601 timestamp
+    expect(Number.isNaN(Date.parse(composition.date!))).toBe(false)
+    // LOINC 60591-5 (Patient summary Document) still set on .type
+    expect(composition.type!.coding![0].code).toBe('60591-5')
+  }
+
+  const assertSectionConformance = (
+    section: NonNullable<R4.IComposition['section']>[number],
+    expectedLoincCode?: string,
+  ) => {
+    // section.code is 1..1 in the IPS profile
+    expect(section.code).toBeDefined()
+    expect(section.code!.coding).toBeDefined()
+    expect(section.code!.coding!.length).toBeGreaterThan(0)
+    if (expectedLoincCode) {
+      const loinc = section.code!.coding!.find(c => c.system === 'http://loinc.org')
+      expect(loinc).toBeDefined()
+      expect(loinc!.code).toBe(expectedLoincCode)
+    }
+
+    // section.text (narrative) is 1..1 in the IPS profile
+    expect(section.text).toBeDefined()
+    expect(section.text!.status).toBe(R4.NarrativeStatusKind._generated)
+    expect(section.text!.div).toMatch(/^<div xmlns="http:\/\/www\.w3\.org\/1999\/xhtml">/)
+
+    // emptyReason is required when there are no entries
+    if (!section.entry || section.entry.length === 0) {
+      expect(section.emptyReason).toBeDefined()
+      expect(section.emptyReason!.coding![0].system).toBe(
+        'http://terminology.hl7.org/CodeSystem/list-empty-reason',
+      )
+    } else {
+      expect(section.emptyReason).toBeUndefined()
+    }
+  }
+
+  it('generateIpsbundle: Composition has status, date, title and IPS-conformant sections', async () => {
+    const mockClient = {
+      request: jest.fn()
+        .mockResolvedValueOnce([patient1])
+        .mockResolvedValueOnce([encounter1])
+        .mockResolvedValueOnce([]),
+    }
+
+    const result = await generateIpsbundle(
+      [patient1],
+      mockClient as any,
+      '2026-01-01',
+      'http://example.org/ids',
+    )
+
+    const composition = result.entry![0] as R4.IComposition
+    assertCompositionMetadata(composition)
+
+    const sectionBy = (title: string) => composition.section!.find(s => s.title === title)!
+    assertSectionConformance(sectionBy('Patient Records'))
+    assertSectionConformance(sectionBy('Encounters'), '46240-8')
+    // Observations is empty here → must carry emptyReason
+    assertSectionConformance(sectionBy('Observations'))
+  })
+
+  it('generateCrossFacilityIpsBundle: Composition has status, date, title and IPS-conformant sections', async () => {
+    const allergy = { resourceType: 'AllergyIntolerance', id: 'al-001' }
+    const condition = { resourceType: 'Condition', id: 'cd-001' }
+    const medRequest = { resourceType: 'MedicationRequest', id: 'mr-001' }
+    const immunization = { resourceType: 'Immunization', id: 'im-001' }
+    const procedure = { resourceType: 'Procedure', id: 'pr-001' }
+
+    mockGotGet.mockReturnValueOnce({
+      json: () => Promise.resolve(makeFhirSearchResponse([
+        patient1, encounter1, observation1,
+        allergy, condition, medRequest, immunization, procedure,
+      ])),
+    })
+
+    const result = await generateCrossFacilityIpsBundle(['pt-001'])
+    const composition = result.entry![0] as R4.IComposition
+    assertCompositionMetadata(composition)
+
+    const sectionBy = (title: string) => composition.section!.find(s => s.title === title)!
+    // Required IPS sections must carry the IG-specified LOINC codes
+    assertSectionConformance(sectionBy('Allergies and Intolerances'), '48765-2')
+    assertSectionConformance(sectionBy('Problem List'), '11450-4')
+    assertSectionConformance(sectionBy('Medication Summary'), '10160-0')
+    assertSectionConformance(sectionBy('Immunizations'), '11369-6')
+    assertSectionConformance(sectionBy('Procedures'), '47519-4')
+    assertSectionConformance(sectionBy('Diagnostic Reports'), '30954-2')
+    // Non-IPS sections still get a code (project-local or LOINC) and narrative
+    assertSectionConformance(sectionBy('Patient Records'))
+    assertSectionConformance(sectionBy('Encounters'), '46240-8')
+    assertSectionConformance(sectionBy('Service Requests'))
+    assertSectionConformance(sectionBy('Observations'))
+  })
+
+  it('empty sections carry an emptyReason and narrative; populated sections do not', async () => {
+    mockGotGet.mockReturnValueOnce({
+      json: () => Promise.resolve(makeFhirSearchResponse([patient1])),
+    })
+
+    const result = await generateCrossFacilityIpsBundle(['pt-001'])
+    const composition = result.entry![0] as R4.IComposition
+
+    const emptySection = composition.section!.find(s => s.title === 'Allergies and Intolerances')!
+    expect(emptySection.entry).toHaveLength(0)
+    expect(emptySection.emptyReason).toBeDefined()
+    expect(emptySection.text!.div).toContain('No allergies and intolerances available.')
+
+    const populatedSection = composition.section!.find(s => s.title === 'Patient Records')!
+    expect(populatedSection.entry!.length).toBeGreaterThan(0)
+    expect(populatedSection.emptyReason).toBeUndefined()
+    expect(populatedSection.text!.div).toContain('Patient Records (1 entry)')
+  })
+})
