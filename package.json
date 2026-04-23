@@ -39,7 +39,7 @@
     "openhim-mediator-utils": "^0.4.0",
     "sprintf-js": "^1.1.2",
     "urijs": "^1.19.11",
-    "uuid": "^3.3.3",
+    "uuid": "^14.0.0",
     "uuid4": "^1.1.4",
     "winston": "^3.2.1",
     "winston-daily-rotate-file": "^4.4.2"
