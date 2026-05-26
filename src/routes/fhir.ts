@@ -3,9 +3,10 @@ import express, { Request, Response } from 'express'
 import got from 'got'
 import URI from 'urijs'
 import config from '../lib/config'
-import { getHapiPassthrough, invalidBundle, invalidBundleMessage, emptyBundle, emptyBundleResponse } from '../lib/helpers'
+import { emptyBundle, emptyBundleResponse, getHapiPassthrough, invalidBundle, invalidBundleMessage } from '../lib/helpers'
 import logger from '../lib/winston'
-import { generateSimpleIpsBundle } from '../workflows/ipsWorkflows'
+import { R4 } from '@ahryman40k/ts-fhir-types'
+import { generateCrossFacilityIpsBundle } from '../workflows/ipsWorkflows'
 import { getResourceTypeEnum, isValidResourceType } from '../lib/validate'
 import { getMetadata } from '../lib/helpers'
 
@@ -30,14 +31,21 @@ const MPI_LOOKUP_TIMEOUT_MS =
  *
  * Returns the enriched patient resource, or the original if no CR match found.
  */
-async function resolvePatientMpi(patient: any): Promise<any> {
+interface MpiResolution {
+  patient: R4.IPatient
+  goldenRecordId: string | null
+  crSourcePatients: R4.IPatient[]
+}
+
+async function resolvePatientMpi(patient: R4.IPatient): Promise<MpiResolution> {
   const crUrl = config.get('clientRegistryUrl')
   if (!crUrl || !patient || patient.resourceType !== 'Patient') {
-    return patient
+    return { patient, goldenRecordId: null, crSourcePatients: [] }
   }
 
   const identifiers = patient.identifier ? (Array.isArray(patient.identifier) ? patient.identifier  :  [patient.identifier]): []
   let goldenRecordId: string | null = null
+  const crSourcePatients: R4.IPatient[] = []
 
   const options = {
     username: config.get('clientRegistryUsername') || config.get('fhirServer:username'),
@@ -68,7 +76,8 @@ async function resolvePatientMpi(patient: any): Promise<any> {
             resource.meta.tag.some((t: any) => t.code === GOLDEN_RECORD_CODE)
           ) {
             goldenRecordId = resource.id
-            break
+          } else if (resource && resource.resourceType === 'Patient') {
+            crSourcePatients.push(resource)
           }
         }
       }
@@ -92,19 +101,174 @@ async function resolvePatientMpi(patient: any): Promise<any> {
     if (!alreadyLinked) {
       patient.link.push({
         other: { reference: `Patient/${goldenRecordId}` },
-        type: 'refer',
+        type: R4.Patient_LinkTypeKind._refer,
       })
     }
   } else {
     logger.info(`MPI lookup: no golden record found for Patient/${patient.id}`)
   }
 
-  return patient
+  return { patient, goldenRecordId, crSourcePatients }
+}
+
+/**
+ * Build a golden record Patient resource from OpenCR source patients.
+ *
+ * Demographics resolution:
+ * - name: Takes the "official" name from the most recently updated source patient.
+ *         Falls back to any name if no "official" use is found.
+ *         All unique names from all sources are included on the resource.
+ * - gender, birthDate: Taken from the most recently updated source.
+ * - identifier: Merged from all sources, deduplicated by system|value.
+ * - link: "seealso" entries pointing to each source patient in the SHR.
+ */
+function buildGoldenRecordPatient(
+  goldenRecordId: string,
+  crSourcePatients: R4.IPatient[],
+  shrSourcePatientIds: string[],
+): R4.IPatient {
+  // Sort sources by lastUpdated descending — most recent first
+  const sorted = [...crSourcePatients].sort((a, b) => {
+    const ta = a.meta?.lastUpdated || ''
+    const tb = b.meta?.lastUpdated || ''
+    return tb.localeCompare(ta)
+  })
+
+  // Resolve official name: pick from the most recent source that has one
+  let officialName: R4.IHumanName | null = null
+  const allNames: R4.IHumanName[] = []
+  const seenNames = new Set<string>()
+
+  for (const source of sorted) {
+    for (const name of source.name || []) {
+      const key = `${name.use || ''}|${name.family || ''}|${(name.given || []).join(',')}`
+      if (seenNames.has(key)) continue
+      seenNames.add(key)
+
+      if (name.use === 'official' && !officialName) {
+        officialName = { ...name }
+      }
+      allNames.push(name)
+    }
+  }
+
+  // Build the name array: official name first, then others
+  const names: R4.IHumanName[] = []
+  if (officialName) {
+    names.push(officialName)
+  }
+  for (const name of allNames) {
+    const isOfficial = officialName &&
+      name.family === officialName.family &&
+      JSON.stringify(name.given) === JSON.stringify(officialName.given) &&
+      name.use === officialName.use
+    if (!isOfficial) {
+      names.push(name)
+    }
+  }
+  // If no official name found, just use all names as-is
+  if (names.length === 0 && allNames.length > 0) {
+    names.push(...allNames)
+  }
+
+  // Gender and birthDate from most recent source
+  const mostRecent = sorted[0]
+  const gender = mostRecent?.gender
+  const birthDate = mostRecent?.birthDate
+
+  // Merge identifiers from all sources, deduplicated
+  const identifiers: R4.IIdentifier[] = []
+  const seenIds = new Set<string>()
+  for (const source of crSourcePatients) {
+    for (const ident of source.identifier || []) {
+      const key = `${ident.system || ''}|${ident.value || ''}`
+      if (!seenIds.has(key)) {
+        seenIds.add(key)
+        identifiers.push(ident)
+      }
+    }
+  }
+
+  return {
+    resourceType: 'Patient',
+    id: goldenRecordId,
+    identifier: identifiers,
+    active: true,
+    name: names,
+    gender,
+    birthDate,
+    link: shrSourcePatientIds.map(pid => ({
+      other: { reference: `Patient/${pid}` },
+      type: R4.Patient_LinkTypeKind._seealso,
+    })),
+  }
+}
+
+/**
+ * Update the golden record Patient resource in the SHR with demographics
+ * resolved from OpenCR source patients. Runs as a background operation
+ * so it does not block the main write path.
+ */
+async function updateGoldenRecordInShr(goldenRecordId: string, crSourcePatients: R4.IPatient[], shrSourcePatientIds: string[]): Promise<void> {
+  const fhirBase = config.get('fhirServer:baseURL')
+  try {
+    const goldenPatient = buildGoldenRecordPatient(goldenRecordId, crSourcePatients, shrSourcePatientIds)
+    await got.put(`${fhirBase}/Patient/${goldenRecordId}`, {
+      json: goldenPatient,
+      username: config.get('fhirServer:username'),
+      password: config.get('fhirServer:password'),
+      timeout: { request: 5000 },
+      retry: { limit: 1, methods: ['PUT' as const] },
+    })
+    logger.info(`Updated golden record Patient/${goldenRecordId} with resolved demographics`)
+  } catch (error: any) {
+    logger.warn(`Failed to update golden record Patient/${goldenRecordId}: ${error.message}`)
+  }
+}
+
+/**
+ * Rewrite Patient references in a clinical resource to use the golden record ID.
+ * Recursively traverses the resource to catch nested references (e.g., performer.actor,
+ * participant.individual) in addition to top-level fields like subject and patient.
+ */
+function rewritePatientReferences(resource: any, patientReferenceMap: Map<string, string>): void {
+  if (!resource || typeof resource !== 'object') return
+
+  const visited = new WeakSet<object>()
+
+  const visit = (node: any, path: string): void => {
+    if (!node || typeof node !== 'object') return
+    if (visited.has(node)) return
+    visited.add(node)
+
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) {
+        visit(node[i], `${path}[${i}]`)
+      }
+      return
+    }
+
+    if (typeof node.reference === 'string') {
+      const ref = node.reference as string
+      const goldenId = patientReferenceMap.get(ref)
+      if (goldenId) {
+        logger.info(`Rewriting ${path}.reference: ${ref} → Patient/${goldenId}`)
+        node.reference = `Patient/${goldenId}`
+      }
+    }
+
+    for (const key of Object.keys(node)) {
+      visit(node[key], path ? `${path}.${key}` : key)
+    }
+  }
+
+  visit(resource, 'resource')
 }
 
 /**
  * Enrich a FHIR Bundle by resolving Patient resources against the MPI.
- * Non-Patient resources are passed through unchanged.
+ * After resolving golden records, rewrites patient references in clinical
+ * resources so all data points to the golden record Patient ID.
  * Processes patients in batches of MPI_CONCURRENCY to avoid overwhelming the CR.
  */
 const MPI_CONCURRENCY = 5
@@ -118,14 +282,49 @@ async function enrichBundleWithMpi(bundle: any): Promise<any> {
 
   if (patientEntries.length === 0) return bundle
 
+  // Build a mapping of local patient references (Patient/<id> or fullUrl) → golden record ID
+  const patientReferenceMap = new Map<string, string>()
+  // Collect CR source patients per golden record for demographics resolution
+  const goldenRecordSources = new Map<string, R4.IPatient[]>()
+  const goldenRecordShrPatients = new Map<string, Set<string>>()
+
   // Process in batches to limit concurrent CR requests
   for (let i = 0; i < patientEntries.length; i += MPI_CONCURRENCY) {
     const batch = patientEntries.slice(i, i + MPI_CONCURRENCY)
     await Promise.all(
       batch.map((entry: any) =>
         resolvePatientMpi(entry.resource)
-          .then((resolved: any) => {
-            entry.resource = resolved
+          .then((resolution: MpiResolution) => {
+            entry.resource = resolution.patient
+            if (resolution.goldenRecordId) {
+              const patientId = resolution.patient.id
+              if (patientId) {
+                patientReferenceMap.set(`Patient/${patientId}`, resolution.goldenRecordId)
+              }
+              if (typeof entry.fullUrl === 'string' && entry.fullUrl.length > 0) {
+                patientReferenceMap.set(entry.fullUrl, resolution.goldenRecordId)
+              }
+
+              // Collect CR sources for golden record demographics — merge across resolutions
+              if (!goldenRecordSources.has(resolution.goldenRecordId)) {
+                goldenRecordSources.set(resolution.goldenRecordId, [...resolution.crSourcePatients])
+              } else {
+                const existing = goldenRecordSources.get(resolution.goldenRecordId)!
+                const existingIds = new Set(existing.map((p: R4.IPatient) => p.id))
+                for (const src of resolution.crSourcePatients) {
+                  if (src.id && !existingIds.has(src.id)) {
+                    existing.push(src)
+                    existingIds.add(src.id)
+                  }
+                }
+              }
+              if (!goldenRecordShrPatients.has(resolution.goldenRecordId)) {
+                goldenRecordShrPatients.set(resolution.goldenRecordId, new Set())
+              }
+              if (patientId) {
+                goldenRecordShrPatients.get(resolution.goldenRecordId)!.add(patientId)
+              }
+            }
           })
           .catch((err: any) => {
             logger.warn(`MPI enrichment failed for Patient/${entry.resource.id}: ${err.message}`)
@@ -134,7 +333,103 @@ async function enrichBundleWithMpi(bundle: any): Promise<any> {
     )
   }
 
+  // Rewrite patient references in all non-Patient resources
+  if (patientReferenceMap.size > 0) {
+    logger.info(`Rewriting patient references for ${patientReferenceMap.size} patient reference(s) in bundle`)
+    for (const entry of bundle.entry) {
+      if (entry.resource && entry.resource.resourceType !== 'Patient') {
+        rewritePatientReferences(entry.resource, patientReferenceMap)
+      }
+    }
+  }
+
+  // Update golden record Patient resources in the SHR with resolved demographics (background)
+  for (const [grId, crSources] of goldenRecordSources.entries()) {
+    if (crSources.length > 0) {
+      const shrPids = Array.from(goldenRecordShrPatients.get(grId) || [])
+      updateGoldenRecordInShr(grId, crSources, shrPids).catch((err: any) => {
+        logger.warn(`Background golden record update failed for ${grId}: ${err.message}`)
+      })
+    }
+  }
+
   return bundle
+}
+
+/**
+ * Given a patient ID, find all patients in the SHR that share the same golden record.
+ * 1. Fetch Patient/<id> from HAPI FHIR
+ * 2. Check if it has a link of type "refer" to a golden record
+ * 3. If so, search for all other patients that also link to that golden record
+ * 4. Return all linked patient IDs (including the original)
+ *
+ * Falls back to [patientId] if no golden record link is found.
+ */
+interface LinkedPatientsResolution {
+  patientIds: string[]
+  goldenRecordId: string | null
+}
+
+async function resolveAllLinkedPatients(patientId: string): Promise<LinkedPatientsResolution> {
+  const fhirBase = config.get('fhirServer:baseURL')
+  const options = {
+    username: config.get('fhirServer:username'),
+    password: config.get('fhirServer:password'),
+  }
+
+  try {
+    // Step 1: Fetch the requested patient
+    const patient: any = await got.get(`${fhirBase}/Patient/${patientId}`, options).json()
+    if (!patient || !patient.link) return { patientIds: [patientId], goldenRecordId: null }
+
+    // Step 2: Find the golden record reference
+    let goldenRecordId: string | null = null
+    for (const link of patient.link) {
+      if (link.type === 'refer' && link.other && link.other.reference) {
+        const match = link.other.reference.match(/^Patient\/(.+)$/)
+        if (match) {
+          goldenRecordId = match[1]
+          break
+        }
+      }
+    }
+
+    if (!goldenRecordId) return { patientIds: [patientId], goldenRecordId: null }
+
+    // Step 3: Find all patients that link to this golden record (with pagination)
+    let searchUrl: string | null = `${fhirBase}/Patient?link=${encodeURIComponent(`Patient/${goldenRecordId}`)}&_elements=id&_count=200`
+    const patientIds = new Set<string>()
+
+    while (searchUrl) {
+      const bundle: any = await got.get(searchUrl, options).json()
+
+      if (bundle && bundle.entry) {
+        for (const entry of bundle.entry) {
+          if (entry.resource && entry.resource.id) {
+            patientIds.add(entry.resource.id)
+          }
+        }
+      }
+
+      const nextLink = bundle && bundle.link
+        ? bundle.link.find((link: any) => link.relation === 'next' && link.url)
+        : null
+      searchUrl = nextLink ? nextLink.url : null
+    }
+
+    // Include the golden record itself — clinical data may reference it directly
+    patientIds.add(goldenRecordId)
+
+    // Ensure the original patient is included
+    patientIds.add(patientId)
+
+    const resolvedPatientIds = Array.from(patientIds)
+    logger.info(`Golden record ${goldenRecordId}: found ${resolvedPatientIds.length} linked patients: ${resolvedPatientIds.join(', ')}`)
+    return { patientIds: resolvedPatientIds, goldenRecordId }
+  } catch (error: any) {
+    logger.warn(`Failed to resolve linked patients for ${patientId}: ${error.message}`)
+    return { patientIds: [patientId], goldenRecordId: null }
+  }
 }
 
 router.get('/', (req: Request, res: Response) => {
@@ -188,8 +483,10 @@ router.get('/:resource/:id?/:operation?', async (req: Request, res: Response) =>
       // Handle IPS Generation.
 
       if (req.params.id && req.params.id.length > 0 && req.params.id[0] != '$') {
-        // ** If using logical id of the Patient object, create summary from objects directly connected to the patient.
-        result = await generateSimpleIpsBundle(req.params.id)
+        // Resolve all linked patients via golden record and generate IPS.
+        const { patientIds: allPatientIds, goldenRecordId } = await resolveAllLinkedPatients(req.params.id)
+        logger.info(`IPS: Patient/${req.params.id} → ${allPatientIds.length} linked patient(s)`)
+        result = await generateCrossFacilityIpsBundle(allPatientIds, goldenRecordId)
       } else if (req.params.id == '$summary') {
         /**
          * If not using logical id, use the Client Registry to resolve patient identity:
@@ -279,7 +576,14 @@ export async function saveResource(req: any, res: any, operation?: string) {
   // Resolve Patient against MPI before saving, but do not block the save if MPI resolution fails.
   if (resourceType === 'Patient') {
     try {
-      resource = await resolvePatientMpi(resource)
+      const resolution = await resolvePatientMpi(resource)
+      resource = resolution.patient
+      // Update golden record demographics in the background
+      if (resolution.goldenRecordId && resolution.crSourcePatients.length > 0 && resource.id) {
+        updateGoldenRecordInShr(resolution.goldenRecordId, resolution.crSourcePatients, [resource.id]).catch((err: any) => {
+          logger.warn(`Background golden record update failed: ${err.message}`)
+        })
+      }
     } catch (error: any) {
       logger.warn(
         'Failed to resolve Patient against MPI during saveResource; continuing with original resource: ' +

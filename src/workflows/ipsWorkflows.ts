@@ -27,6 +27,122 @@ import logger from '../lib/winston'
     Advance Directives
 */
 
+const IPS_COMPOSITION_TITLE = 'International Patient Summary'
+
+const IPS_COMPOSITION_TYPE: R4.ICodeableConcept = {
+  coding: [
+    {
+      system: 'http://loinc.org',
+      code: '60591-5',
+      display: 'Patient summary Document',
+    },
+  ],
+}
+
+const LOCAL_SECTION_SYSTEM = 'http://openhie.org/sedish/CodeSystem/ips-sections'
+
+// LOINC codes are used for sections that map to the IPS IG; project-local
+// codes are used for the custom sections this mediator exposes.
+const SECTION_CODES: Record<string, { system: string; code: string; display: string }> = {
+  'Patient Records': { system: LOCAL_SECTION_SYSTEM, code: 'patient-records', display: 'Patient Records' },
+  'Allergies and Intolerances': { system: 'http://loinc.org', code: '48765-2', display: 'Allergies and adverse reactions Document' },
+  'Problem List': { system: 'http://loinc.org', code: '11450-4', display: 'Problem list - Reported' },
+  'Medication Summary': { system: 'http://loinc.org', code: '10160-0', display: 'History of Medication use Narrative' },
+  'Encounters': { system: 'http://loinc.org', code: '46240-8', display: 'History of Hospitalizations+Outpatient visits Narrative' },
+  'Service Requests': { system: LOCAL_SECTION_SYSTEM, code: 'service-requests', display: 'Service Requests' },
+  'Diagnostic Reports': { system: 'http://loinc.org', code: '30954-2', display: 'Relevant diagnostic tests/laboratory data note' },
+  'Observations': { system: LOCAL_SECTION_SYSTEM, code: 'observations', display: 'Observations' },
+  'Immunizations': { system: 'http://loinc.org', code: '11369-6', display: 'History of Immunization note' },
+  'Procedures': { system: 'http://loinc.org', code: '47519-4', display: 'History of Procedures Document' },
+}
+
+const IPS_EMPTY_REASON: R4.ICodeableConcept = {
+  coding: [
+    {
+      system: 'http://terminology.hl7.org/CodeSystem/list-empty-reason',
+      code: 'unavailable',
+      display: 'Unavailable',
+    },
+  ],
+  text: 'No data available',
+}
+
+function escapeXml(input: string): string {
+  return input.replace(/[&<>"']/g, c => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&apos;',
+  }[c] as string))
+}
+
+function buildLocalSectionCode(title: string): string {
+  const slug = title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  return slug || 'section'
+}
+
+function buildIpsSection(title: string, entries: R4.IReference[]): R4.IComposition_Section {
+  const coded = SECTION_CODES[title]
+  const sectionCoding = coded
+    ? { system: coded.system, code: coded.code, display: coded.display }
+    : { system: LOCAL_SECTION_SYSTEM, code: buildLocalSectionCode(title), display: title }
+
+  if (!coded) {
+    logger.warn(
+      `Missing IPS section code mapping for title "${title}", using deterministic local code "${sectionCoding.code}"`,
+    )
+  }
+
+  const code: R4.ICodeableConcept = {
+    coding: [sectionCoding],
+    text: title,
+  }
+
+  const safeTitle = escapeXml(title)
+  const hasEntries = entries.length > 0
+  const div = hasEntries
+    ? `<div xmlns="http://www.w3.org/1999/xhtml"><p>${safeTitle} (${entries.length} ${entries.length === 1 ? 'entry' : 'entries'})</p></div>`
+    : `<div xmlns="http://www.w3.org/1999/xhtml"><p>No ${safeTitle.toLowerCase()} available.</p></div>`
+
+  const section: R4.IComposition_Section = {
+    title,
+    code,
+    text: { status: R4.NarrativeStatusKind._generated, div },
+    entry: entries,
+  }
+
+  if (!hasEntries) {
+    section.emptyReason = IPS_EMPTY_REASON
+  }
+
+  return section
+}
+
+function buildIpsComposition(
+  subject: R4.IReference | null,
+  sections: R4.IComposition_Section[],
+): R4.IComposition {
+  const composition: R4.IComposition = {
+    resourceType: 'Composition',
+    status: R4.CompositionStatusKind._final,
+    type: IPS_COMPOSITION_TYPE,
+    date: new Date().toISOString(),
+    title: IPS_COMPOSITION_TITLE,
+    author: [{ display: 'SHR System' }],
+    section: sections,
+  }
+  if (subject) {
+    composition.subject = subject
+  }
+  return composition
+}
+
 export async function generateIpsbundle(
   patients: R4.IPatient[],
   shrClient: Client,
@@ -62,41 +178,20 @@ export async function generateIpsbundle(
     resourceType: 'Bundle',
   }
 
-  const ipsCompositionType: R4.ICodeableConcept = {
-    coding: [
-      {
-        system: 'http://loinc.org',
-        code: '60591-5',
-        display: 'Patient summary Document',
-      },
-    ],
-  }
-
-  const ipsComposition: R4.IComposition = {
-    resourceType: 'Composition',
-    type: ipsCompositionType,
-    author: [{ display: 'SHR System' }],
-    section: [
-      {
-        title: 'Patient Records',
-        entry: shrPatients.map((p: R4.IPatient) => {
-          return { reference: `Patient/${p.id!}` }
-        }),
-      },
-      {
-        title: 'Encounters',
-        entry: encounters.map((e: R4.IEncounter) => {
-          return { reference: `Encounter/${e.id!}` }
-        }),
-      },
-      {
-        title: 'Observations',
-        entry: observations.map((o: R4.IObservation) => {
-          return { reference: `Observation/${o.id!}` }
-        }),
-      },
-    ],
-  }
+  const ipsComposition = buildIpsComposition(null, [
+    buildIpsSection(
+      'Patient Records',
+      shrPatients.map((p: R4.IPatient) => ({ reference: `Patient/${p.id!}` })),
+    ),
+    buildIpsSection(
+      'Encounters',
+      encounters.map((e: R4.IEncounter) => ({ reference: `Encounter/${e.id!}` })),
+    ),
+    buildIpsSection(
+      'Observations',
+      observations.map((o: R4.IObservation) => ({ reference: `Observation/${o.id!}` })),
+    ),
+  ])
 
   ipsBundle.type = R4.BundleTypeKind._document
   ipsBundle.entry = []
@@ -107,128 +202,175 @@ export async function generateIpsbundle(
 
   return ipsBundle
 }
-export async function generateSimpleIpsBundle(patientId: string): Promise<R4.IBundle> {
+/**
+ * Generate an IPS bundle that aggregates clinical data across multiple patients
+ * that share the same golden record. This enables cross-facility patient summaries.
+ *
+ * @param patientIds - Array of patient IDs linked to the same golden record
+ */
+export async function generateCrossFacilityIpsBundle(
+  patientIds: string[],
+  goldenRecordId?: string | null,
+): Promise<R4.IBundle> {
   const ipsBundle: R4.IBundle = {
     resourceType: 'Bundle',
   }
 
-  const ipsCompositionType: R4.ICodeableConcept = {
-    coding: [
-      {
-        system: 'http://loinc.org',
-        code: '60591-5',
-        display: 'Patient summary Document',
-      },
-    ],
-  }
-
-  // Fetch SHR components
-  /**
-   * Get Encounters where: relevant to medical summary
-   * Get AllergyIntolerance
-   * Get observations relevant to problem lists
-   * Get observations relevant to immunizations
-   * Get observations relevant to diagnostic results
-   * Get observations relevant to labs
-   * Get plan of care?
-   */
   try {
-    // TODO: get pagination implemented
-    const searchBundle = <R4.IBundle>await got
-      .get(
-        `${config.get('fhirServer:baseURL')}/Patient?_id=${patientId}&_include=*&_revinclude=*`,
-        {
-          username: config.get('fhirServer:username'),
-          password: config.get('fhirServer:password'),
-        },
-      )
-      .json()
+    const fhirBase = config.get('fhirServer:baseURL')
+    const options = {
+      username: config.get('fhirServer:username'),
+      password: config.get('fhirServer:password'),
+    }
+
     const ipsSections: any = {
       Patient: [],
       Encounter: [],
       ServiceRequest: [],
-      DiagnosticResult: [],
+      DiagnosticReport: [],
       Observation: [],
+      AllergyIntolerance: [],
+      Condition: [],
+      MedicationRequest: [],
+      MedicationStatement: [],
+      Immunization: [],
+      Procedure: [],
     }
 
-    if (searchBundle && searchBundle.entry && searchBundle.entry.length > 0) {
-      searchBundle.entry.map(e => {
-        if (e.resource) {
-          const resourceType = e.resource.resourceType
-          const resourceKey = resourceType.toString() as keyof any
+    // Track seen resource IDs per type to deduplicate in O(1) per entry
+    const seenIds: Record<string, Set<string>> = {}
 
-          if (!ipsSections[resourceKey] || ipsSections[resourceKey].length == 0) {
-            ipsSections[resourceKey] = []
+    // Fetch data for each linked patient with bounded parallelism and merge into sections
+    const IPS_FETCH_CONCURRENCY = 4
+
+    const processBundleEntries = (searchBundle: R4.IBundle) => {
+      if (searchBundle && searchBundle.entry && searchBundle.entry.length > 0) {
+        for (const e of searchBundle.entry) {
+          if (e.resource && e.resource.id) {
+            const resourceKey = String(e.resource.resourceType)
+
+            if (!ipsSections[resourceKey]) {
+              ipsSections[resourceKey] = []
+            }
+            if (!seenIds[resourceKey]) {
+              seenIds[resourceKey] = new Set()
+            }
+
+            // Deduplicate by resource ID using Set for O(1) lookup
+            if (!seenIds[resourceKey].has(e.resource.id)) {
+              seenIds[resourceKey].add(e.resource.id)
+              ipsSections[resourceKey].push(e.resource)
+            }
           }
-
-          ipsSections[resourceKey].push(e.resource)
         }
-      })
+      }
     }
 
-    if (ipsSections['Patient'] && ipsSections['Patient'].length == 1) {
-      const ipsComposition: R4.IComposition = {
-        resourceType: 'Composition',
-        type: ipsCompositionType,
-        author: [{ display: 'SHR System' }],
-        subject: { reference: `Patient/${ipsSections['Patient'][0].id}` },
-        section: [
-          {
-            title: 'Patient Records',
-            entry: ipsSections['Patient'].map((p: R4.IPatient) => {
-              return { reference: `Patient/${p.id!}` }
-            }),
-          },
-          {
-            title: 'Encounters',
-            entry: ipsSections['Encounter'].map((e: R4.IEncounter) => {
-              return { reference: `Encounter/${e.id!}` }
-            }),
-          },
-          {
-            title: 'Service Requests',
-            entry: ipsSections['ServiceRequest'].map((sr: R4.IServiceRequest) => {
-              return { reference: `ServiceRequest/${sr.id!}` }
-            }),
-          },
-          {
-            title: 'Diagnostic Reports',
-            entry: ipsSections['DiagnosticReport'].map((dr: R4.IDiagnosticReport) => {
-              return { reference: `DiagnosticReport/${dr.id!}` }
-            }),
-          },
-          {
-            title: 'Observations',
-            entry: ipsSections['Observation'].map((o: R4.IObservation) => {
-              return { reference: `Observation/${o.id!}` }
-            }),
-          },
+    const SEARCH_COUNT = 200
+    for (let i = 0; i < patientIds.length; i += IPS_FETCH_CONCURRENCY) {
+      const batch = patientIds.slice(i, i + IPS_FETCH_CONCURRENCY)
+      await Promise.all(
+        batch.map(async (pid) => {
+          let nextUrl: string | null = `${fhirBase}/Patient?_id=${encodeURIComponent(pid)}&_include=*&_revinclude=*&_count=${SEARCH_COUNT}`
+          try {
+            while (nextUrl) {
+              const searchBundle = <R4.IBundle>await got.get(nextUrl, options).json()
+              processBundleEntries(searchBundle)
+              const nextLink = searchBundle.link
+                ? searchBundle.link.find(
+                    (link: NonNullable<R4.IBundle['link']>[number]) => link.relation === 'next' && link.url,
+                  )
+                : undefined
+              nextUrl = nextLink?.url || null
+            }
+          } catch (err: any) {
+            logger.warn(`Failed to fetch data for Patient/${pid}: ${err.message}`)
+            return
+          }
+        }),
+      )
+    }
+
+    const primaryPatientById = goldenRecordId
+      ? ipsSections['Patient'].find((p: R4.IPatient) => p.id === goldenRecordId)
+      : null
+
+    // Prefer the golden record Patient as the primary subject.
+    // Fall back to "seealso", then first patient with demographics, then first patient.
+    const primaryPatient = primaryPatientById || ipsSections['Patient'].find((p: any) =>
+      p.link && p.link.some((l: any) => l.type === 'seealso')
+    ) || ipsSections['Patient'].find((p: any) => p.name && p.name.length > 0)
+      || ipsSections['Patient'][0]
+
+    if (primaryPatient) {
+      const ipsComposition = buildIpsComposition(
+        { reference: `Patient/${primaryPatient.id}` },
+        [
+          buildIpsSection(
+            'Patient Records',
+            ipsSections['Patient'].map((p: R4.IPatient) => ({ reference: `Patient/${p.id!}` })),
+          ),
+          buildIpsSection(
+            'Allergies and Intolerances',
+            ipsSections['AllergyIntolerance'].map((a: any) => ({ reference: `AllergyIntolerance/${a.id}` })),
+          ),
+          buildIpsSection(
+            'Problem List',
+            ipsSections['Condition'].map((c: any) => ({ reference: `Condition/${c.id}` })),
+          ),
+          buildIpsSection('Medication Summary', [
+            ...ipsSections['MedicationRequest'].map((m: any) => ({ reference: `MedicationRequest/${m.id}` })),
+            ...ipsSections['MedicationStatement'].map((m: any) => ({ reference: `MedicationStatement/${m.id}` })),
+          ]),
+          buildIpsSection(
+            'Encounters',
+            ipsSections['Encounter'].map((e: R4.IEncounter) => ({ reference: `Encounter/${e.id!}` })),
+          ),
+          buildIpsSection(
+            'Service Requests',
+            ipsSections['ServiceRequest'].map((sr: any) => ({ reference: `ServiceRequest/${sr.id}` })),
+          ),
+          buildIpsSection(
+            'Diagnostic Reports',
+            ipsSections['DiagnosticReport'].map((dr: any) => ({ reference: `DiagnosticReport/${dr.id}` })),
+          ),
+          buildIpsSection(
+            'Observations',
+            ipsSections['Observation'].map((o: R4.IObservation) => ({ reference: `Observation/${o.id!}` })),
+          ),
+          buildIpsSection(
+            'Immunizations',
+            ipsSections['Immunization'].map((i: any) => ({ reference: `Immunization/${i.id}` })),
+          ),
+          buildIpsSection(
+            'Procedures',
+            ipsSections['Procedure'].map((p: any) => ({ reference: `Procedure/${p.id}` })),
+          ),
         ],
-      }
+      )
 
       ipsBundle.type = R4.BundleTypeKind._document
       ipsBundle.entry = []
       ipsBundle.entry.push(ipsComposition)
 
+      // Add all resources to the bundle
       const bundleTypes = [
-        'Patient',
-        'Encounter',
-        'ServiceRequest',
-        'DiagnosticReport',
-        'Observation',
+        'Patient', 'AllergyIntolerance', 'Condition', 'MedicationRequest',
+        'MedicationStatement', 'Encounter', 'ServiceRequest', 'DiagnosticReport',
+        'Observation', 'Immunization', 'Procedure',
       ]
-      bundleTypes.forEach((rt: string) => {
+      for (const rt of bundleTypes) {
         if (ipsSections[rt] && ipsSections[rt].length > 0 && ipsBundle.entry) {
           ipsBundle.entry = ipsBundle.entry.concat(ipsSections[rt])
         }
-      })
+      }
     } else {
-      // TODO: Return Error Bundle
-      logger.error(`Cant generate IPS for patient ${patientId}`)
+      logger.error(`Cannot generate cross-facility IPS: no patients found for IDs ${patientIds.join(', ')}`)
     }
   } catch (e) {
-    logger.error(`Cant generate IPS for patient ${patientId}:\n${e}`)
+    logger.error(`Cannot generate cross-facility IPS for patients ${patientIds.join(', ')}:\n${e}`)
   }
+
   return ipsBundle
 }
 
