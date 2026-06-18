@@ -468,6 +468,34 @@ describe('generateConsolidatedIpsBundle', () => {
     expect(mockGotGet.mock.calls.every(c => !String(c[0]).includes('_revinclude'))).toBe(true)
   })
 
+  it('merges demographics from the source onto the (empty) golden subject', async () => {
+    // Real OpenCR golden records may carry no demographics; the name lives on the source.
+    const emptyGolden: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'gold-2',
+      meta: { tag: [{ code: GOLDEN_RECORD_TAG }] },
+    }
+    const namedSource: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'src-9',
+      name: [{ family: 'Pierre', given: ['Marie'] }],
+      gender: R4.PatientGenderKind._female,
+      birthDate: '1990-01-01',
+      identifier: [{ system: 'http://sedish-haiti.org/fhir/source-key', value: '21100-1046' }],
+    }
+    mockGotGet.mockImplementation(() => respond([]))
+
+    const result = await generateConsolidatedIpsBundle([emptyGolden, namedSource])
+    const comp = result.entry![0] as R4.IComposition
+    expect(comp.subject!.reference).toBe('Patient/gold-2') // keeps the golden id
+    const subjectEntry = result.entry!.find(
+      e => (e as any).resourceType === 'Patient' && (e as any).id === 'gold-2',
+    ) as any
+    expect(subjectEntry.name[0].family).toBe('Pierre') // demographics merged from the source
+    expect(subjectEntry.gender).toBe('female')
+    expect(subjectEntry.identifier[0].value).toBe('21100-1046')
+  })
+
   it('falls back to the record itself when there is no golden tag (singleton)', async () => {
     mockGotGet.mockImplementation((url: string) => {
       if (url.includes('Observation?patient=Patient/lone-1')) return respond([obsFor('obs-9', 'lone-1')])

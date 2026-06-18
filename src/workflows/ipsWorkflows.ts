@@ -408,6 +408,39 @@ export function splitGoldenAndSources(
   return { goldenRecord, sourceIds }
 }
 
+// Build the IPS subject: the golden record id carrying demographics merged from the site source
+// records (system-of-record for name/gender/birthDate), with identifiers unioned across all.
+function mergeDemographics(golden: R4.IPatient, sources: R4.IPatient[]): R4.IPatient {
+  const pick = (pred: (p: R4.IPatient) => boolean) =>
+    golden && pred(golden) ? golden : sources.find(pred)
+  const nameSrc = pick(p => !!(p.name && p.name.length))
+  const genderSrc = pick(p => !!p.gender)
+  const birthSrc = pick(p => !!p.birthDate)
+
+  const seen = new Set<string>()
+  const identifier: R4.IIdentifier[] = []
+  for (const p of [golden, ...sources]) {
+    for (const id of p.identifier || []) {
+      const key = `${id.system || ''}|${id.value || ''}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        identifier.push(id)
+      }
+    }
+  }
+
+  return {
+    resourceType: 'Patient',
+    id: golden.id,
+    active: true,
+    meta: golden.meta,
+    name: nameSrc?.name,
+    gender: genderSrc?.gender,
+    birthDate: birthSrc?.birthDate,
+    identifier: identifier.length ? identifier : undefined,
+  }
+}
+
 // Rewrite a clinical resource's subject/patient reference from any site source-id to the golden
 // id, so the generated IPS document is single-subject. Operates on the freshly fetched copy only —
 // the resources stored in the SHR are never modified.
@@ -442,14 +475,18 @@ export async function generateConsolidatedIpsBundle(
 ): Promise<R4.IBundle> {
   const ipsBundle: R4.IBundle = { resourceType: 'Bundle' }
 
-  const { goldenRecord, sourceIds } = splitGoldenAndSources(mpiPatients)
-  // Fall back to the first MPI patient if no golden tag (singleton/unmatched record).
-  const subject = goldenRecord || mpiPatients[0] || null
-  if (!subject || !subject.id) {
+  const { goldenRecord } = splitGoldenAndSources(mpiPatients)
+  const sourcePatients = mpiPatients.filter(p => p.id && p !== goldenRecord)
+  const base = goldenRecord || mpiPatients[0] || null
+  if (!base || !base.id) {
     logger.error('Cannot generate consolidated IPS: no patient resolved from the MPI')
     return ipsBundle
   }
-  const gatherIds = sourceIds.length > 0 ? sourceIds : [subject.id]
+  const gatherIds = sourcePatients.length > 0 ? sourcePatients.map(p => p.id as string) : [base.id]
+  // Subject = the golden record id with demographics merged from the site sources. OpenCR golden
+  // records may carry no demographics, and the SHR holds none (Patient stubs), so the name/gender/
+  // birthDate/identifiers come from the source records. Singleton records use themselves.
+  const subject: R4.IPatient = goldenRecord ? mergeDemographics(goldenRecord, sourcePatients) : base
 
   const fhirBase = config.get('fhirServer:baseURL')
   const options = {
@@ -512,7 +549,7 @@ export async function generateConsolidatedIpsBundle(
   // Single-subject document: point all gathered clinical at the golden record.
   const sourceIdSet = new Set(gatherIds)
   for (const rt of Object.keys(collected)) {
-    for (const r of collected[rt]) rewriteSubjectToGolden(r, sourceIdSet, subject.id)
+    for (const r of collected[rt]) rewriteSubjectToGolden(r, sourceIdSet, base.id)
   }
 
   const refs = (rt: string): R4.IReference[] =>
