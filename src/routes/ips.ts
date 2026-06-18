@@ -4,7 +4,11 @@ import express, { Request, Response } from 'express'
 import fhirClient from 'fhirclient'
 import config from '../lib/config'
 import logger from '../lib/winston'
-import { generateIpsbundle, generateUpdateBundle } from '../workflows/ipsWorkflows'
+import {
+  GOLDEN_RECORD_TAG,
+  generateConsolidatedIpsBundle,
+  generateUpdateBundle,
+} from '../workflows/ipsWorkflows'
 import { sprintf } from 'sprintf-js'
 import { getMetadata } from '../lib/helpers'
 
@@ -18,88 +22,63 @@ router.get('/', (req: Request, res: Response) => {
 
 router.get('/metadata', getMetadata())
 
-router.get('/Patient/cruid/:id/:lastUpdated?', async (req: Request, res: Response) => {
+// Consolidated IPS by golden-record id (CRUID). Identity (golden + all linked site source-ids)
+// is resolved from the MPI; clinical is gathered from the SHR per source-id. See
+// generateConsolidatedIpsBundle for why this works with demographics held only in the MPI.
+router.get('/Patient/cruid/:id', async (req: Request, res: Response) => {
   const cruid = req.params.id
-  const lastUpdated = req.params.lastUpdated
   const mpiUrl = config.get('clientRegistryUrl')
-  const shrUrl = config.get('fhirServer:baseURL')
 
-  logger.info(
-    sprintf(
-      'Received a request for an ISP for patient with cruid: %s | lastUpdagted: %s',
-      cruid,
-      lastUpdated,
-    ),
-  )
+  logger.info(sprintf('Received a request for a consolidated IPS for cruid: %s', cruid))
 
   const mpiClient = fhirClient(req, res).client({
     serverUrl: mpiUrl,
     username: config.get('fhirServer:username'),
     password: config.get('fhirServer:password'),
   })
-  const shrClient = fhirClient(req, res).client({
-    serverUrl: shrUrl,
-    username: config.get('fhirServer:username'),
-    password: config.get('fhirServer:password'),
-  })
 
-  // Fetch records for linked patients from MPI
+  // The golden record + every site source linked to it (golden.link[seealso] -> sources).
   const mpiPatients = await mpiClient.request<R4.IPatient[]>(
     `Patient?_id=${cruid}&_include=Patient:link`,
     { flat: true },
   )
 
-  const ipsBundle = await generateIpsbundle(mpiPatients, shrClient, lastUpdated, system)
-
+  const ipsBundle = await generateConsolidatedIpsBundle(mpiPatients)
   res.status(200).json(ipsBundle)
 })
 
-router.get('/Patient/:id/:lastUpdated?', async (req: Request, res: Response) => {
+// Consolidated IPS by a site identifier (system = app:mpiSystem). Resolves the identifier to its
+// golden record, then to all linked sources, then assembles the same consolidated IPS.
+router.get('/Patient/:id', async (req: Request, res: Response) => {
   const patientId = req.params.id
-  const lastUpdated = req.params.lastUpdated
   const mpiUrl = config.get('clientRegistryUrl')
-  const shrUrl = config.get('fhirServer:baseURL')
 
-  logger.info(
-    sprintf(
-      'Received a request for an ISP with a bundle of resources\npatient id: %s | lastUpdagted: %s',
-      patientId,
-      lastUpdated,
-    ),
-  )
+  logger.info(sprintf('Received a request for a consolidated IPS for patient id: %s', patientId))
 
-  // Create Client
   const mpiClient = fhirClient(req, res).client({
     serverUrl: mpiUrl,
     username: config.get('fhirServer:username'),
     password: config.get('fhirServer:password'),
   })
-  const shrClient = fhirClient(req, res).client({
-    serverUrl: shrUrl,
-    username: config.get('fhirServer:username'),
-    password: config.get('fhirServer:password'),
-  })
 
-  // Query MPI to get all patients
-  // TODO: parameterize identifier specifics and account for diffent types of identifiers
+  // Resolve the identifier to its golden record, then enumerate all linked sources by cruid.
   const goldenRecordRes = await mpiClient.request<R4.IPatient[]>(
     `Patient?identifier=${system}|${patientId}&_include=Patient:link`,
     { flat: true },
   )
   const goldenRecord = goldenRecordRes.find(
-    x => x.meta && x.meta.tag && x.meta.tag[0].code === '5c827da5-4858-4f3d-a50c-62ece001efea',
+    x => x.meta && x.meta.tag && x.meta.tag.some(t => t.code === GOLDEN_RECORD_TAG),
   )
 
   if (goldenRecord) {
-    const cruid = goldenRecord.id
     const mpiPatients = await mpiClient.request<R4.IPatient[]>(
-      `Patient?_id=${cruid}&_include=Patient:link`,
+      `Patient?_id=${goldenRecord.id}&_include=Patient:link`,
       { flat: true },
     )
-    const ipsBundle = await generateIpsbundle(mpiPatients, shrClient, lastUpdated, system)
+    const ipsBundle = await generateConsolidatedIpsBundle(mpiPatients)
     res.status(200).send(ipsBundle)
   } else {
-    res.sendStatus(500)
+    res.sendStatus(404)
   }
 })
 
