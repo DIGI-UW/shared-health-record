@@ -498,6 +498,9 @@ export async function generateConsolidatedIpsBundle(
   const seenIds: Record<string, Set<string>> = {}
   const collect = (resource: any) => {
     if (!resource || !resource.id || !resource.resourceType) return
+    // Skip retracted clinical: the pipeline marks data the source no longer produces as
+    // entered-in-error rather than deleting it; it must never appear in the patient summary.
+    if (resource.status === 'entered-in-error') return
     const rt = String(resource.resourceType)
     if (!collected[rt]) {
       collected[rt] = []

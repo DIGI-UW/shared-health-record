@@ -509,6 +509,23 @@ describe('generateConsolidatedIpsBundle', () => {
     expect(comp.section!.find(s => s.title === 'Observations')!.entry).toHaveLength(1)
   })
 
+  it('excludes entered-in-error (retracted) clinical from the summary', async () => {
+    const live = obsFor('obs-live', 'src-1')
+    const retracted = { ...obsFor('obs-dead', 'src-1'), status: 'entered-in-error' }
+    mockGotGet.mockImplementation((url: string) => {
+      if (url.includes('Observation?patient=Patient/src-1')) return respond([live, retracted])
+      return respond([])
+    })
+
+    const result = await generateConsolidatedIpsBundle([golden, src1])
+    const comp = result.entry![0] as R4.IComposition
+    const obs = comp.section!.find(s => s.title === 'Observations')!
+    expect(obs.entry).toHaveLength(1)
+    expect(obs.entry![0].reference).toBe('Observation/obs-live')
+    // the retracted resource is not in the bundle either
+    expect(result.entry!.some(e => (e as any).id === 'obs-dead')).toBe(false)
+  })
+
   it('deduplicates clinical that appears under more than one source', async () => {
     const shared = obsFor('obs-shared', 'src-1')
     mockGotGet.mockImplementation((url: string) => {
