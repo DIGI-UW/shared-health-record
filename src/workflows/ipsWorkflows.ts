@@ -374,6 +374,226 @@ export async function generateCrossFacilityIpsBundle(
   return ipsBundle
 }
 
+// OpenCR tags golden (master) records with this code on Patient.meta.tag.
+export const GOLDEN_RECORD_TAG = '5c827da5-4858-4f3d-a50c-62ece001efea'
+
+// Clinical resource types gathered for a consolidated IPS, queried by the `patient` compartment
+// search param. This works even though Patient resources do NOT live in the SHR (demographics are
+// held only in the MPI/OpenCR per the SEDISH architecture), because clinical resources keep their
+// subject reference to the site-specific Patient id.
+const IPS_CLINICAL_TYPES = [
+  'AllergyIntolerance',
+  'Condition',
+  'MedicationRequest',
+  'MedicationStatement',
+  'Immunization',
+  'Procedure',
+  'DiagnosticReport',
+  'ServiceRequest',
+  'Observation',
+  'Encounter',
+] as const
+
+/**
+ * Split a set of MPI (OpenCR) Patient resources into the golden (master) record and the
+ * site-specific source ids linked to it. The golden record is identified by its meta.tag; the
+ * remaining patients are the site sources whose ids key the clinical data in the SHR.
+ */
+export function splitGoldenAndSources(
+  mpiPatients: R4.IPatient[],
+): { goldenRecord: R4.IPatient | null; sourceIds: string[] } {
+  const goldenRecord =
+    mpiPatients.find(p => p.meta?.tag?.some(t => t.code === GOLDEN_RECORD_TAG)) || null
+  const sourceIds = mpiPatients.filter(p => p.id && p !== goldenRecord).map(p => p.id!)
+  return { goldenRecord, sourceIds }
+}
+
+// Build the IPS subject: the golden record id carrying demographics merged from the site source
+// records (system-of-record for name/gender/birthDate), with identifiers unioned across all.
+function mergeDemographics(golden: R4.IPatient, sources: R4.IPatient[]): R4.IPatient {
+  const pick = (pred: (p: R4.IPatient) => boolean) =>
+    golden && pred(golden) ? golden : sources.find(pred)
+  const nameSrc = pick(p => !!(p.name && p.name.length))
+  const genderSrc = pick(p => !!p.gender)
+  const birthSrc = pick(p => !!p.birthDate)
+
+  const seen = new Set<string>()
+  const identifier: R4.IIdentifier[] = []
+  for (const p of [golden, ...sources]) {
+    for (const id of p.identifier || []) {
+      const key = `${id.system || ''}|${id.value || ''}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        identifier.push(id)
+      }
+    }
+  }
+
+  return {
+    resourceType: 'Patient',
+    id: golden.id,
+    active: true,
+    meta: golden.meta,
+    name: nameSrc?.name,
+    gender: genderSrc?.gender,
+    birthDate: birthSrc?.birthDate,
+    identifier: identifier.length ? identifier : undefined,
+  }
+}
+
+// Rewrite a clinical resource's subject/patient reference from any site source-id to the golden
+// id, so the generated IPS document is single-subject. Operates on the freshly fetched copy only —
+// the resources stored in the SHR are never modified.
+function rewriteSubjectToGolden(resource: any, sourceIdSet: Set<string>, goldenId: string): void {
+  for (const field of ['subject', 'patient']) {
+    const ref = resource?.[field]?.reference
+    if (typeof ref === 'string') {
+      const match = ref.match(/Patient\/([^/?]+)/)
+      if (match && sourceIdSet.has(match[1])) {
+        resource[field].reference = `Patient/${goldenId}`
+      }
+    }
+  }
+}
+
+/**
+ * Generate a consolidated IPS for a person across every site they are known at, using the
+ * MPI-first resolution that matches the SEDISH architecture:
+ *
+ *   - identity (the golden record and its linked site source-ids) comes from OpenCR — passed in
+ *     as `mpiPatients` (a golden record + the patients _include=Patient:link resolved against it)
+ *   - clinical is gathered from the SHR by the `patient` search param for each source-id, so it
+ *     works even though Patient resources are not stored in the SHR (demographics-out)
+ *
+ * Because the source-id set is resolved from OpenCR on every request, a merge done after the data
+ * was written is reflected immediately with no SHR reprocessing. Clinical references are rewritten
+ * to the golden id so the document is single-subject. The golden record (with demographics from
+ * the MPI) is the Composition subject and is included as the Patient entry.
+ */
+export async function generateConsolidatedIpsBundle(
+  mpiPatients: R4.IPatient[],
+): Promise<R4.IBundle> {
+  const ipsBundle: R4.IBundle = { resourceType: 'Bundle' }
+
+  const { goldenRecord } = splitGoldenAndSources(mpiPatients)
+  const sourcePatients = mpiPatients.filter(p => p.id && p !== goldenRecord)
+  const base = goldenRecord || mpiPatients[0] || null
+  if (!base || !base.id) {
+    logger.error('Cannot generate consolidated IPS: no patient resolved from the MPI')
+    return ipsBundle
+  }
+  const gatherIds = sourcePatients.length > 0 ? sourcePatients.map(p => p.id as string) : [base.id]
+  // Subject = the golden record id with demographics merged from the site sources. OpenCR golden
+  // records may carry no demographics, and the SHR holds none (Patient stubs), so the name/gender/
+  // birthDate/identifiers come from the source records. Singleton records use themselves.
+  const subject: R4.IPatient = goldenRecord ? mergeDemographics(goldenRecord, sourcePatients) : base
+
+  const fhirBase = config.get('fhirServer:baseURL')
+  const options = {
+    username: config.get('fhirServer:username'),
+    password: config.get('fhirServer:password'),
+  }
+
+  const collected: Record<string, any[]> = {}
+  const seenIds: Record<string, Set<string>> = {}
+  const collect = (resource: any) => {
+    if (!resource || !resource.id || !resource.resourceType) return
+    // Skip retracted clinical: the pipeline marks data the source no longer produces as
+    // entered-in-error rather than deleting it; it must never appear in the patient summary.
+    if (resource.status === 'entered-in-error') return
+    const rt = String(resource.resourceType)
+    if (!collected[rt]) {
+      collected[rt] = []
+      seenIds[rt] = new Set()
+    }
+    if (!seenIds[rt].has(resource.id)) {
+      seenIds[rt].add(resource.id)
+      collected[rt].push(resource)
+    }
+  }
+
+  const SEARCH_COUNT = 200
+  const PATIENT_FETCH_CONCURRENCY = 4
+  try {
+    for (let i = 0; i < gatherIds.length; i += PATIENT_FETCH_CONCURRENCY) {
+      const batch = gatherIds.slice(i, i + PATIENT_FETCH_CONCURRENCY)
+      await Promise.all(
+        batch.map(async pid => {
+          for (const type of IPS_CLINICAL_TYPES) {
+            let nextUrl: string | null = `${fhirBase}/${type}?patient=Patient/${encodeURIComponent(
+              pid,
+            )}&_count=${SEARCH_COUNT}`
+            try {
+              while (nextUrl) {
+                const searchBundle = <R4.IBundle>await got.get(nextUrl, options).json()
+                if (searchBundle && searchBundle.entry) {
+                  for (const e of searchBundle.entry) collect(e.resource)
+                }
+                const nextLink = searchBundle.link
+                  ? searchBundle.link.find(
+                      (link: NonNullable<R4.IBundle['link']>[number]) =>
+                        link.relation === 'next' && link.url,
+                    )
+                  : undefined
+                nextUrl = nextLink?.url || null
+              }
+            } catch (err: any) {
+              logger.warn(`Failed to fetch ${type} for Patient/${pid}: ${err.message}`)
+            }
+          }
+        }),
+      )
+    }
+  } catch (e) {
+    logger.error(`Cannot generate consolidated IPS for ${subject.id}:\n${e}`)
+    return ipsBundle
+  }
+
+  // Single-subject document: point all gathered clinical at the golden record.
+  const sourceIdSet = new Set(gatherIds)
+  for (const rt of Object.keys(collected)) {
+    for (const r of collected[rt]) rewriteSubjectToGolden(r, sourceIdSet, base.id)
+  }
+
+  const refs = (rt: string): R4.IReference[] =>
+    (collected[rt] || []).map((r: any) => ({ reference: `${rt}/${r.id}` }))
+
+  const ipsComposition = buildIpsComposition({ reference: `Patient/${subject.id}` }, [
+    buildIpsSection('Patient Records', [{ reference: `Patient/${subject.id}` }]),
+    buildIpsSection('Allergies and Intolerances', refs('AllergyIntolerance')),
+    buildIpsSection('Problem List', refs('Condition')),
+    buildIpsSection('Medication Summary', [...refs('MedicationRequest'), ...refs('MedicationStatement')]),
+    buildIpsSection('Encounters', refs('Encounter')),
+    buildIpsSection('Service Requests', refs('ServiceRequest')),
+    buildIpsSection('Diagnostic Reports', refs('DiagnosticReport')),
+    buildIpsSection('Observations', refs('Observation')),
+    buildIpsSection('Immunizations', refs('Immunization')),
+    buildIpsSection('Procedures', refs('Procedure')),
+  ])
+
+  ipsBundle.type = R4.BundleTypeKind._document
+  ipsBundle.entry = [ipsComposition, subject]
+  const order = [
+    'AllergyIntolerance',
+    'Condition',
+    'MedicationRequest',
+    'MedicationStatement',
+    'Encounter',
+    'ServiceRequest',
+    'DiagnosticReport',
+    'Observation',
+    'Immunization',
+    'Procedure',
+  ]
+  for (const rt of order) {
+    if (collected[rt] && collected[rt].length > 0) {
+      ipsBundle.entry = ipsBundle.entry.concat(collected[rt])
+    }
+  }
+
+  return ipsBundle
+}
+
 export function generateUpdateBundle(
   values: R4.IDomainResource[][],
   lastUpdated?: string,

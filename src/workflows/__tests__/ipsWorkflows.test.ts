@@ -1,4 +1,10 @@
-import { generateIpsbundle, generateCrossFacilityIpsBundle } from '../ipsWorkflows'
+import {
+  generateIpsbundle,
+  generateCrossFacilityIpsBundle,
+  generateConsolidatedIpsBundle,
+  splitGoldenAndSources,
+  GOLDEN_RECORD_TAG,
+} from '../ipsWorkflows'
 import { R4 } from '@ahryman40k/ts-fhir-types'
 
 // Mock got for generateCrossFacilityIpsBundle
@@ -384,6 +390,153 @@ describe('generateCrossFacilityIpsBundle', () => {
     const composition = result.entry![0] as R4.IComposition
     const obsSection = composition.section!.find(s => s.title === 'Observations')
     expect(obsSection!.entry).toHaveLength(1)
+  })
+})
+
+// --- splitGoldenAndSources ---
+
+describe('splitGoldenAndSources', () => {
+  it('separates the tagged golden record from its site sources', () => {
+    const golden: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'gold-1',
+      meta: { tag: [{ code: GOLDEN_RECORD_TAG }] },
+    }
+    const { goldenRecord, sourceIds } = splitGoldenAndSources([golden, patient1, patient2])
+    expect(goldenRecord!.id).toBe('gold-1')
+    expect(sourceIds).toEqual(['pt-001', 'pt-002'])
+  })
+
+  it('returns null golden and all ids as sources when no tagged record is present', () => {
+    const { goldenRecord, sourceIds } = splitGoldenAndSources([patient1])
+    expect(goldenRecord).toBeNull()
+    expect(sourceIds).toEqual(['pt-001'])
+  })
+})
+
+// --- generateConsolidatedIpsBundle (MPI-resolved, demographics-out) ---
+
+describe('generateConsolidatedIpsBundle', () => {
+  const golden: R4.IPatient = {
+    resourceType: 'Patient',
+    id: 'gold-1',
+    name: [{ family: 'Gold', given: ['Record'] }],
+    meta: { tag: [{ code: GOLDEN_RECORD_TAG }] },
+  }
+  const src1: R4.IPatient = { resourceType: 'Patient', id: 'src-1' }
+  const src2: R4.IPatient = { resourceType: 'Patient', id: 'src-2' }
+
+  const obsFor = (id: string, pid: string): any => ({
+    resourceType: 'Observation', id, status: 'final', code: { text: 'x' },
+    subject: { reference: `Patient/${pid}` },
+  })
+  const condFor = (id: string, pid: string): any => ({
+    resourceType: 'Condition', id, subject: { reference: `Patient/${pid}` },
+  })
+  const respond = (resources: any[]) => ({
+    json: () => Promise.resolve({
+      resourceType: 'Bundle', type: 'searchset',
+      entry: resources.map(r => ({ resource: r })),
+    }),
+  })
+
+  it('gathers clinical per source via patient= (never _revinclude) and is single-subject', async () => {
+    mockGotGet.mockImplementation((url: string) => {
+      if (url.includes('Observation?patient=Patient/src-1')) return respond([obsFor('obs-1', 'src-1')])
+      if (url.includes('Condition?patient=Patient/src-2')) return respond([condFor('cond-1', 'src-2')])
+      return respond([])
+    })
+
+    const result = await generateConsolidatedIpsBundle([golden, src1, src2])
+    const comp = result.entry![0] as R4.IComposition
+    const sec = (t: string) => comp.section!.find(s => s.title === t)!
+
+    // golden record is the subject and is included as the Patient entry (demographics from MPI)
+    expect(comp.subject!.reference).toBe('Patient/gold-1')
+    expect(result.entry!.some(e => (e as any).resourceType === 'Patient' && (e as any).id === 'gold-1')).toBe(true)
+
+    // clinical gathered from both sites
+    expect(sec('Observations').entry).toHaveLength(1)
+    expect(sec('Problem List').entry).toHaveLength(1)
+
+    // clinical references are rewritten to the golden record
+    const obsEntry = result.entry!.find(e => (e as any).resourceType === 'Observation') as any
+    expect(obsEntry.subject.reference).toBe('Patient/gold-1')
+
+    // gathered by the patient compartment param; never by the Patient _revinclude path (no Patient in SHR)
+    expect(mockGotGet.mock.calls.some(c => String(c[0]).includes('patient=Patient/src-1'))).toBe(true)
+    expect(mockGotGet.mock.calls.every(c => !String(c[0]).includes('_revinclude'))).toBe(true)
+  })
+
+  it('merges demographics from the source onto the (empty) golden subject', async () => {
+    // Real OpenCR golden records may carry no demographics; the name lives on the source.
+    const emptyGolden: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'gold-2',
+      meta: { tag: [{ code: GOLDEN_RECORD_TAG }] },
+    }
+    const namedSource: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'src-9',
+      name: [{ family: 'Pierre', given: ['Marie'] }],
+      gender: R4.PatientGenderKind._female,
+      birthDate: '1990-01-01',
+      identifier: [{ system: 'http://sedish-haiti.org/fhir/source-key', value: '21100-1046' }],
+    }
+    mockGotGet.mockImplementation(() => respond([]))
+
+    const result = await generateConsolidatedIpsBundle([emptyGolden, namedSource])
+    const comp = result.entry![0] as R4.IComposition
+    expect(comp.subject!.reference).toBe('Patient/gold-2') // keeps the golden id
+    const subjectEntry = result.entry!.find(
+      e => (e as any).resourceType === 'Patient' && (e as any).id === 'gold-2',
+    ) as any
+    expect(subjectEntry.name[0].family).toBe('Pierre') // demographics merged from the source
+    expect(subjectEntry.gender).toBe('female')
+    expect(subjectEntry.identifier[0].value).toBe('21100-1046')
+  })
+
+  it('falls back to the record itself when there is no golden tag (singleton)', async () => {
+    mockGotGet.mockImplementation((url: string) => {
+      if (url.includes('Observation?patient=Patient/lone-1')) return respond([obsFor('obs-9', 'lone-1')])
+      return respond([])
+    })
+    const lone: R4.IPatient = { resourceType: 'Patient', id: 'lone-1', name: [{ family: 'Lone' }] }
+
+    const result = await generateConsolidatedIpsBundle([lone])
+    const comp = result.entry![0] as R4.IComposition
+    expect(comp.subject!.reference).toBe('Patient/lone-1')
+    expect(comp.section!.find(s => s.title === 'Observations')!.entry).toHaveLength(1)
+  })
+
+  it('excludes entered-in-error (retracted) clinical from the summary', async () => {
+    const live = obsFor('obs-live', 'src-1')
+    const retracted = { ...obsFor('obs-dead', 'src-1'), status: 'entered-in-error' }
+    mockGotGet.mockImplementation((url: string) => {
+      if (url.includes('Observation?patient=Patient/src-1')) return respond([live, retracted])
+      return respond([])
+    })
+
+    const result = await generateConsolidatedIpsBundle([golden, src1])
+    const comp = result.entry![0] as R4.IComposition
+    const obs = comp.section!.find(s => s.title === 'Observations')!
+    expect(obs.entry).toHaveLength(1)
+    expect(obs.entry![0].reference).toBe('Observation/obs-live')
+    // the retracted resource is not in the bundle either
+    expect(result.entry!.some(e => (e as any).id === 'obs-dead')).toBe(false)
+  })
+
+  it('deduplicates clinical that appears under more than one source', async () => {
+    const shared = obsFor('obs-shared', 'src-1')
+    mockGotGet.mockImplementation((url: string) => {
+      if (url.includes('Observation?patient=Patient/src-1')) return respond([shared])
+      if (url.includes('Observation?patient=Patient/src-2')) return respond([{ ...shared }])
+      return respond([])
+    })
+
+    const result = await generateConsolidatedIpsBundle([golden, src1, src2])
+    const comp = result.entry![0] as R4.IComposition
+    expect(comp.section!.find(s => s.title === 'Observations')!.entry).toHaveLength(1)
   })
 })
 
