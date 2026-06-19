@@ -14,6 +14,12 @@ export const router = express.Router()
 
 const GOLDEN_RECORD_CODE = config.get('goldenRecordCode') || '5c827da5-4858-4f3d-a50c-62ece001efea'
 
+// Link-only mode (SEDISH "demographics-out" topology): on write, resolve each Patient to its MPI
+// golden record and store ONLY a demographics-stripped stub carrying the refer link. Do NOT write
+// golden-record demographics into the SHR and do NOT rewrite clinical references to the golden —
+// clinical stays on the site-specific Patient id (the consolidated IPS resolves it via OpenCR).
+const MPI_LINK_ONLY = config.get('mpiLinkOnly') === true || config.get('mpiLinkOnly') === 'true'
+
 // Timeout for MPI lookups — prevents slow CR from stalling SHR writes.
 // Falls back to 5 seconds if not configured or invalid.
 const rawMpiLookupTimeoutMs = config.get('mpiLookupTimeoutMs')
@@ -273,6 +279,16 @@ function rewritePatientReferences(resource: any, patientReferenceMap: Map<string
  */
 const MPI_CONCURRENCY = 5
 
+// Reduce a Patient to an identity/linkage stub: keep id, identifiers, link and meta; drop ALL
+// demographics (name, gender, birthDate, address, telecom, …) so the SHR never stores PII.
+export function stripDemographics(patient: R4.IPatient): R4.IPatient {
+  const stub: R4.IPatient = { resourceType: 'Patient', id: patient.id, active: true }
+  if (patient.meta) stub.meta = patient.meta
+  if (patient.identifier) stub.identifier = patient.identifier
+  if (patient.link) stub.link = patient.link
+  return stub
+}
+
 async function enrichBundleWithMpi(bundle: any): Promise<any> {
   if (!bundle || !bundle.entry) return bundle
 
@@ -281,6 +297,28 @@ async function enrichBundleWithMpi(bundle: any): Promise<any> {
   )
 
   if (patientEntries.length === 0) return bundle
+
+  // Link-only: resolve each Patient to its golden record and store a demographics-stripped stub
+  // with the refer link. No golden-demographics write, no clinical rewrite (clinical stays on the
+  // site id). Even when MPI resolution fails the stub is stripped, so PII never reaches the SHR.
+  if (MPI_LINK_ONLY) {
+    for (let i = 0; i < patientEntries.length; i += MPI_CONCURRENCY) {
+      const batch = patientEntries.slice(i, i + MPI_CONCURRENCY)
+      await Promise.all(
+        batch.map((entry: any) =>
+          resolvePatientMpi(entry.resource)
+            .then((resolution: MpiResolution) => {
+              entry.resource = stripDemographics(resolution.patient)
+            })
+            .catch((err: any) => {
+              logger.warn(`MPI link-only resolution failed for Patient/${entry.resource.id}: ${err.message}`)
+              entry.resource = stripDemographics(entry.resource)
+            }),
+        ),
+      )
+    }
+    return bundle
+  }
 
   // Build a mapping of local patient references (Patient/<id> or fullUrl) → golden record ID
   const patientReferenceMap = new Map<string, string>()
@@ -577,18 +615,25 @@ export async function saveResource(req: any, res: any, operation?: string) {
   if (resourceType === 'Patient') {
     try {
       const resolution = await resolvePatientMpi(resource)
-      resource = resolution.patient
-      // Update golden record demographics in the background
-      if (resolution.goldenRecordId && resolution.crSourcePatients.length > 0 && resource.id) {
-        updateGoldenRecordInShr(resolution.goldenRecordId, resolution.crSourcePatients, [resource.id]).catch((err: any) => {
-          logger.warn(`Background golden record update failed: ${err.message}`)
-        })
+      // Link-only: store a demographics-stripped stub with the refer link; never write golden
+      // demographics into the SHR.
+      if (MPI_LINK_ONLY) {
+        resource = stripDemographics(resolution.patient)
+      } else {
+        resource = resolution.patient
+        // Update golden record demographics in the background
+        if (resolution.goldenRecordId && resolution.crSourcePatients.length > 0 && resource.id) {
+          updateGoldenRecordInShr(resolution.goldenRecordId, resolution.crSourcePatients, [resource.id]).catch((err: any) => {
+            logger.warn(`Background golden record update failed: ${err.message}`)
+          })
+        }
       }
     } catch (error: any) {
       logger.warn(
         'Failed to resolve Patient against MPI during saveResource; continuing with original resource: ' +
           (error?.message || String(error))
       )
+      if (MPI_LINK_ONLY) resource = stripDemographics(resource)
     }
   }
 
