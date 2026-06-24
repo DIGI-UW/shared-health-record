@@ -289,6 +289,36 @@ export function stripDemographics(patient: R4.IPatient): R4.IPatient {
   return stub
 }
 
+// A demographics-free golden-record stub. In link-only mode the source stubs carry a refer link to
+// Patient/<golden>; we create that golden ourselves as a controlled, tagged stub instead of relying
+// on HAPI to auto-create a bare placeholder. Keeps the SHR demographics-out (no PII on the golden).
+export function buildGoldenStub(goldenRecordId: string): R4.IPatient {
+  return {
+    resourceType: 'Patient',
+    id: goldenRecordId,
+    active: true,
+    meta: { tag: [{ code: GOLDEN_RECORD_CODE }] },
+  }
+}
+
+// Ensure the golden record exists in the SHR as a demographics-free stub (single-resource path).
+// Awaited (not fire-and-forget) so the refer target exists before the source stub is saved; failure
+// is logged but non-fatal (HAPI's placeholder behaviour still backstops the reference).
+async function ensureGoldenStub(goldenRecordId: string): Promise<void> {
+  const fhirBase = config.get('fhirServer:baseURL')
+  try {
+    await got.put(`${fhirBase}/Patient/${goldenRecordId}`, {
+      json: buildGoldenStub(goldenRecordId),
+      username: config.get('fhirServer:username'),
+      password: config.get('fhirServer:password'),
+      timeout: { request: 5000 },
+      retry: { limit: 1, methods: ['PUT' as const] },
+    })
+  } catch (error: any) {
+    logger.warn(`Failed to create golden record stub Patient/${goldenRecordId}: ${error.message}`)
+  }
+}
+
 async function enrichBundleWithMpi(bundle: any): Promise<any> {
   if (!bundle || !bundle.entry) return bundle
 
@@ -302,6 +332,7 @@ async function enrichBundleWithMpi(bundle: any): Promise<any> {
   // with the refer link. No golden-demographics write, no clinical rewrite (clinical stays on the
   // site id). Even when MPI resolution fails the stub is stripped, so PII never reaches the SHR.
   if (MPI_LINK_ONLY) {
+    const goldenIds = new Set<string>()
     for (let i = 0; i < patientEntries.length; i += MPI_CONCURRENCY) {
       const batch = patientEntries.slice(i, i + MPI_CONCURRENCY)
       await Promise.all(
@@ -309,6 +340,7 @@ async function enrichBundleWithMpi(bundle: any): Promise<any> {
           resolvePatientMpi(entry.resource)
             .then((resolution: MpiResolution) => {
               entry.resource = stripDemographics(resolution.patient)
+              if (resolution.goldenRecordId) goldenIds.add(resolution.goldenRecordId)
             })
             .catch((err: any) => {
               logger.warn(`MPI link-only resolution failed for Patient/${entry.resource.id}: ${err.message}`)
@@ -316,6 +348,21 @@ async function enrichBundleWithMpi(bundle: any): Promise<any> {
             }),
         ),
       )
+    }
+    // Create each golden record as a demographics-free stub in the SAME transaction, so the refer
+    // target exists atomically — no reliance on HAPI auto-placeholders, no background-PUT race.
+    const presentPatientIds = new Set(
+      bundle.entry
+        .filter((e: any) => e.resource && e.resource.resourceType === 'Patient' && e.resource.id)
+        .map((e: any) => e.resource.id),
+    )
+    for (const gid of goldenIds) {
+      if (!presentPatientIds.has(gid)) {
+        bundle.entry.push({
+          resource: buildGoldenStub(gid),
+          request: { method: 'PUT', url: `Patient/${gid}` },
+        })
+      }
     }
     return bundle
   }
@@ -619,6 +666,10 @@ export async function saveResource(req: any, res: any, operation?: string) {
       // demographics into the SHR.
       if (MPI_LINK_ONLY) {
         resource = stripDemographics(resolution.patient)
+        // Create the golden as a demographics-free stub first (awaited) so the refer target exists.
+        if (resolution.goldenRecordId && resolution.goldenRecordId !== resource.id) {
+          await ensureGoldenStub(resolution.goldenRecordId)
+        }
       } else {
         resource = resolution.patient
         // Update golden record demographics in the background
