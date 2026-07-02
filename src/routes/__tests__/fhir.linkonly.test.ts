@@ -115,7 +115,40 @@ describe('link-only enrichment (mpiLinkOnly=true)', () => {
     // clinical untouched — stays on the site id, NOT rewritten to the golden
     expect(obs.subject.reference).toBe('Patient/pt-001')
 
-    // no golden-record demographics written to the SHR
+    // golden record created as a demographics-free stub IN the same transaction (atomic — no bare
+    // HAPI placeholder, no background-PUT race)
+    const golden = sent.entry.find((e: any) => e.resource.resourceType === 'Patient' && e.resource.id === GOLD)
+    expect(golden).toBeDefined()
+    expect(golden.request).toEqual({ method: 'PUT', url: `Patient/${GOLD}` })
+    expect(golden.resource.meta.tag).toContainEqual({ code: GOLDEN_RECORD_CODE })
+    expect(golden.resource.name).toBeUndefined()
+    expect(golden.resource.gender).toBeUndefined()
+
+    // the stub is injected into the bundle, not written via a separate PUT
     expect(mockGotPut).not.toHaveBeenCalled()
+  })
+
+  it('saveResource: creates the golden stub (awaited) when saving a single Patient', async () => {
+    mockGotGet.mockReturnValue({ json: () => Promise.resolve(crWithGolden) })
+    mockGotPut.mockResolvedValue({ statusCode: 200, body: '{}' })
+    mockGotDefault.mockResolvedValue({
+      statusCode: 201,
+      body: JSON.stringify({ resourceType: 'Patient', id: 'pt-9' }),
+    })
+
+    await request(app).post('/Patient').send({
+      resourceType: 'Patient',
+      id: 'pt-9',
+      name: [{ family: 'Pierre' }],
+      gender: 'female',
+      identifier: [{ system: 'http://sedish-haiti.org/fhir/source-key', value: '21100-9' }],
+    })
+
+    // golden created as a demographics-free stub, awaited (not fire-and-forget)
+    expect(mockGotPut).toHaveBeenCalled()
+    const [url, opts] = mockGotPut.mock.calls[0]
+    expect(url).toBe(`http://hapi-fhir:8080/fhir/Patient/${GOLD}`)
+    expect(opts.json.meta.tag).toContainEqual({ code: GOLDEN_RECORD_CODE })
+    expect(opts.json.name).toBeUndefined()
   })
 })
