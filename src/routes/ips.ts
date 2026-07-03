@@ -16,6 +16,7 @@ import { getMetadata } from '../lib/helpers'
 export const router = express.Router()
 
 const system = config.get('app:mpiSystem')
+const fpnidSystem = config.get('app:fpnidSystem')
 
 // Server-to-server search against the MPI (OpenCR via OpenHIM). Uses the client-registry
 // credentials — the same ones the FHIR write path uses — rather than the (empty) fhirServer creds
@@ -30,6 +31,28 @@ async function mpiSearch(query: string): Promise<R4.IPatient[]> {
   return (bundle.entry || [])
     .map(e => e.resource as R4.IPatient)
     .filter(r => r && r.resourceType === 'Patient')
+}
+
+// Resolve any site-held identifier (source key, fpnid, ...) to the golden record and every
+// linked source. OpenCR is asked for the identifier; whichever record carries it is followed to
+// its golden (per the spec: CRUID -> else source key -> plus fpnid, all resolve to the golden).
+// Returns the golden + all sources, or null when no golden is found for the identifier.
+async function resolveGoldenAndSources(
+  identifierSystem: string,
+  value: string,
+): Promise<R4.IPatient[] | null> {
+  const hits = await mpiSearch(
+    `Patient?identifier=${identifierSystem}|${value}&_include=Patient:link`,
+  )
+  const goldenRecord = hits.find(
+    x => x.meta && x.meta.tag && x.meta.tag.some(t => t.code === GOLDEN_RECORD_TAG),
+  )
+  if (!goldenRecord) {
+    return null
+  }
+  // Re-query by golden id so we get the golden + every source linked to it (not just the
+  // source that happened to carry the queried identifier).
+  return mpiSearch(`Patient?_id=${goldenRecord.id}&_include=Patient:link`)
 }
 
 router.get('/', (req: Request, res: Response) => {
@@ -52,24 +75,34 @@ router.get('/Patient/cruid/:id', async (req: Request, res: Response) => {
   res.status(200).json(ipsBundle)
 })
 
-// Consolidated IPS by a site identifier (system = app:mpiSystem). Resolves the identifier to its
-// golden record, then to all linked sources, then assembles the same consolidated IPS.
+// Consolidated IPS by biometric national FP ID (fpnid, system = app:fpnidSystem). Resolves the
+// fpnid to its golden record, then to all linked sources, then assembles the consolidated IPS.
+router.get('/Patient/fpnid/:id', async (req: Request, res: Response) => {
+  const fpnid = req.params.id
+  logger.info(sprintf('Received a request for a consolidated IPS for fpnid: %s', fpnid))
+
+  if (!fpnidSystem) {
+    logger.error('app:fpnidSystem is not configured; cannot resolve fpnid retrieval')
+    return res.sendStatus(501)
+  }
+
+  const mpiPatients = await resolveGoldenAndSources(fpnidSystem, fpnid)
+  if (mpiPatients) {
+    res.status(200).json(await generateConsolidatedIpsBundle(mpiPatients))
+  } else {
+    res.sendStatus(404)
+  }
+})
+
+// Consolidated IPS by a site identifier (system = app:mpiSystem, i.e. the source key). Resolves
+// the identifier to its golden record, then to all linked sources, then assembles the IPS.
 router.get('/Patient/:id', async (req: Request, res: Response) => {
   const patientId = req.params.id
   logger.info(sprintf('Received a request for a consolidated IPS for patient id: %s', patientId))
 
-  // Resolve the identifier to its golden record, then enumerate all linked sources by cruid.
-  const goldenRecordRes = await mpiSearch(
-    `Patient?identifier=${system}|${patientId}&_include=Patient:link`,
-  )
-  const goldenRecord = goldenRecordRes.find(
-    x => x.meta && x.meta.tag && x.meta.tag.some(t => t.code === GOLDEN_RECORD_TAG),
-  )
-
-  if (goldenRecord) {
-    const mpiPatients = await mpiSearch(`Patient?_id=${goldenRecord.id}&_include=Patient:link`)
-    const ipsBundle = await generateConsolidatedIpsBundle(mpiPatients)
-    res.status(200).send(ipsBundle)
+  const mpiPatients = await resolveGoldenAndSources(system, patientId)
+  if (mpiPatients) {
+    res.status(200).send(await generateConsolidatedIpsBundle(mpiPatients))
   } else {
     res.sendStatus(404)
   }
