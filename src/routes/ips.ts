@@ -17,6 +17,7 @@ export const router = express.Router()
 
 const system = config.get('app:mpiSystem')
 const fpnidSystem = config.get('app:fpnidSystem')
+const isantePlusSystem = config.get('app:isantePlusSystem')
 
 // Server-to-server search against the MPI (OpenCR via OpenHIM). Uses the client-registry
 // credentials — the same ones the FHIR write path uses — rather than the (empty) fhirServer creds
@@ -87,6 +88,28 @@ router.get('/Patient/fpnid/:id', async (req: Request, res: Response) => {
   }
 
   const mpiPatients = await resolveGoldenAndSources(fpnidSystem, fpnid)
+  if (mpiPatients) {
+    res.status(200).json(await generateConsolidatedIpsBundle(mpiPatients))
+  } else {
+    res.sendStatus(404)
+  }
+})
+
+// Consolidated IPS by iSantePlus identifier (system = app:isantePlusSystem). The EMR sends only its
+// own iSantePlus ID; the mediator resolves it to the golden record in the CR, gathers every linked
+// source, and assembles the consolidated IPS from the SHR — the EMR never talks to OpenCR directly.
+router.get('/Patient/isanteplus/:id', async (req: Request, res: Response) => {
+  const isantePlusId = req.params.id
+  logger.info(
+    sprintf('Received a request for a consolidated IPS for iSantePlus id: %s', isantePlusId),
+  )
+
+  if (!isantePlusSystem) {
+    logger.error('app:isantePlusSystem is not configured; cannot resolve iSantePlus retrieval')
+    return res.sendStatus(501)
+  }
+
+  const mpiPatients = await resolveGoldenAndSources(isantePlusSystem, isantePlusId)
   if (mpiPatients) {
     res.status(200).json(await generateConsolidatedIpsBundle(mpiPatients))
   } else {
