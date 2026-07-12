@@ -73,8 +73,12 @@ describe('IPS fpnid retrieval', () => {
 
     expect(res.status).toBe(200)
     expect(res.body.id).toBe('ips-1')
-    // the identifier query must have used the fpnid system, not the source-key system
-    expect(mockGotGet.mock.calls.some(c => String(c[0]).includes(FPNID_SYSTEM))).toBe(true)
+    // the identifier query must have used the fpnid system, not the source-key system.
+    // Assert on the exact `identifier=` query-param value rather than a loose URL substring.
+    const identifierArg = mockGotGet.mock.calls
+      .map(c => String(c[0]).split('identifier=')[1]?.split('&')[0])
+      .find(Boolean)
+    expect(identifierArg).toBe(`${FPNID_SYSTEM}|HT-0001`)
     expect(generateConsolidatedIpsBundle).toHaveBeenCalled()
   })
 
