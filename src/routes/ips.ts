@@ -17,6 +17,7 @@ export const router = express.Router()
 
 const system = config.get('app:mpiSystem')
 const fpnidSystem = config.get('app:fpnidSystem')
+const isantePlusSystem = config.get('app:isantePlusSystem')
 
 // Server-to-server search against the MPI (OpenCR via OpenHIM). Uses the client-registry
 // credentials — the same ones the FHIR write path uses — rather than the (empty) fhirServer creds
@@ -66,7 +67,7 @@ router.get('/metadata', getMetadata())
 // generateConsolidatedIpsBundle for why this works with demographics held only in the MPI.
 router.get('/Patient/cruid/:id', async (req: Request, res: Response) => {
   const cruid = req.params.id
-  logger.info(sprintf('Received a request for a consolidated IPS for cruid: %s', cruid))
+  logger.info('Received a request for a consolidated IPS by cruid')
 
   // The golden record + every site source linked to it (golden.link[seealso] -> sources).
   const mpiPatients = await mpiSearch(`Patient?_id=${cruid}&_include=Patient:link`)
@@ -79,7 +80,7 @@ router.get('/Patient/cruid/:id', async (req: Request, res: Response) => {
 // fpnid to its golden record, then to all linked sources, then assembles the consolidated IPS.
 router.get('/Patient/fpnid/:id', async (req: Request, res: Response) => {
   const fpnid = req.params.id
-  logger.info(sprintf('Received a request for a consolidated IPS for fpnid: %s', fpnid))
+  logger.info('Received a request for a consolidated IPS by fpnid')
 
   if (!fpnidSystem) {
     logger.error('app:fpnidSystem is not configured; cannot resolve fpnid retrieval')
@@ -94,11 +95,31 @@ router.get('/Patient/fpnid/:id', async (req: Request, res: Response) => {
   }
 })
 
+// Consolidated IPS by iSantePlus identifier (system = app:isantePlusSystem). The EMR sends only its
+// own iSantePlus ID; the mediator resolves it to the golden record in the CR, gathers every linked
+// source, and assembles the consolidated IPS from the SHR — the EMR never talks to OpenCR directly.
+router.get('/Patient/isanteplus/:id', async (req: Request, res: Response) => {
+  const isantePlusId = req.params.id
+  logger.info('Received a request for a consolidated IPS by iSantePlus id')
+
+  if (!isantePlusSystem) {
+    logger.error('app:isantePlusSystem is not configured; cannot resolve iSantePlus retrieval')
+    return res.sendStatus(501)
+  }
+
+  const mpiPatients = await resolveGoldenAndSources(isantePlusSystem, isantePlusId)
+  if (mpiPatients) {
+    res.status(200).json(await generateConsolidatedIpsBundle(mpiPatients))
+  } else {
+    res.sendStatus(404)
+  }
+})
+
 // Consolidated IPS by a site identifier (system = app:mpiSystem, i.e. the source key). Resolves
 // the identifier to its golden record, then to all linked sources, then assembles the IPS.
 router.get('/Patient/:id', async (req: Request, res: Response) => {
   const patientId = req.params.id
-  logger.info(sprintf('Received a request for a consolidated IPS for patient id: %s', patientId))
+  logger.info('Received a request for a consolidated IPS by site identifier')
 
   const mpiPatients = await resolveGoldenAndSources(system, patientId)
   if (mpiPatients) {

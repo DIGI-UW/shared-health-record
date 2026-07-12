@@ -2,7 +2,8 @@
   "app": {
     "port": 3000,
     "mllpPort": 3001,
-    "fpnidSystem": "http://isanteplus.org/openmrs/fhir2/6-biometrics-national-reference-code"
+    "fpnidSystem": "http://isanteplus.org/openmrs/fhir2/6-biometrics-national-reference-code",
+    "isantePlusSystem": "http://isanteplus.org/openmrs/fhir2/3-isanteplus-id"
   },
   "mediator": {
     "api": {
