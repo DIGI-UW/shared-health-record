@@ -417,15 +417,20 @@ function mergeDemographics(golden: R4.IPatient, sources: R4.IPatient[]): R4.IPat
   const genderSrc = pick(p => !!p.gender)
   const birthSrc = pick(p => !!p.birthDate)
 
+  // The IPS subject is a single person, so show ONE identifier per system. A cross-facility golden
+  // aggregates several sources, each with its own facility-scoped source-key / iSantePlus ID; unioning
+  // them all makes the header list many source-keys and iSantePlus IDs. Keep the first value per system
+  // (golden first, then sources) and drop identifiers with no system (corruption).
   const seen = new Set<string>()
   const identifier: R4.IIdentifier[] = []
   for (const p of [golden, ...sources]) {
     for (const id of p.identifier || []) {
-      const key = `${id.system || ''}|${id.value || ''}`
-      if (!seen.has(key)) {
-        seen.add(key)
-        identifier.push(id)
+      const sys = id.system || ''
+      if (!sys || seen.has(sys)) {
+        continue
       }
+      seen.add(sys)
+      identifier.push(id)
     }
   }
 
