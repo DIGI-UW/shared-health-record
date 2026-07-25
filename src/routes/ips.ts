@@ -115,6 +115,22 @@ router.get('/Patient/isanteplus/:id', async (req: Request, res: Response) => {
   }
 })
 
+// Consolidated IPS by SEDISH source-key (<mspp_code>-<patient_id>, system = app:mpiSystem). Explicit
+// route for the EMR ips module, which fetches /Patient/source-key/<key>. The source key is nationally
+// unique (unlike the per-facility iSantePlus id), so it resolves to exactly one patient. Registered
+// before /Patient/:id so the two-segment path is not swallowed by the single-segment catch-all.
+router.get('/Patient/source-key/:id', async (req: Request, res: Response) => {
+  const sourceKey = req.params.id
+  logger.info('Received a request for a consolidated IPS by source-key')
+
+  const mpiPatients = await resolveGoldenAndSources(system, sourceKey)
+  if (mpiPatients) {
+    res.status(200).json(await generateConsolidatedIpsBundle(mpiPatients))
+  } else {
+    res.sendStatus(404)
+  }
+})
+
 // Consolidated IPS by a site identifier (system = app:mpiSystem, i.e. the source key). Resolves
 // the identifier to its golden record, then to all linked sources, then assembles the IPS.
 router.get('/Patient/:id', async (req: Request, res: Response) => {

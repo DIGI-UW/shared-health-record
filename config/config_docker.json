@@ -3,7 +3,8 @@
     "port": 3000,
     "mllpPort": 3001,
     "fpnidSystem": "http://isanteplus.org/openmrs/fhir2/6-biometrics-national-reference-code",
-    "isantePlusSystem": "http://isanteplus.org/openmrs/fhir2/3-isanteplus-id"
+    "isantePlusSystem": "http://isanteplus.org/openmrs/fhir2/3-isanteplus-id",
+    "mpiSystem": "http://sedish-haiti.org/fhir/source-key"
   },
   "mediator": {
     "api": {
