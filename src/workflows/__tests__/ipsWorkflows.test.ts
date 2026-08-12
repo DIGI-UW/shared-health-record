@@ -496,6 +496,56 @@ describe('generateConsolidatedIpsBundle', () => {
     expect(subjectEntry.identifier[0].value).toBe('21100-1046')
   })
 
+  it('keeps every site source key on the subject, but one identifier per other system', async () => {
+    // The requesting EMR checks the subject for ITS OWN source key before displaying the summary. Keeping
+    // only one meant the golden carried whichever site wrote last, and every other site refused to display
+    // a summary that is legitimately theirs.
+    const golden: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'gold-3',
+      meta: { tag: [{ code: GOLDEN_RECORD_TAG }] },
+    }
+    const site44: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'src-44',
+      name: [{ family: 'Turner', given: ['Bob'] }],
+      birthDate: '1996-06-20',
+      identifier: [
+        { system: 'http://sedish-haiti.org/fhir/source-key', value: '73106-96' },
+        { system: 'http://isanteplus.org/openmrs/fhir2/3-isanteplus-id', value: '10030U' },
+      ],
+    }
+    const site18: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'src-18',
+      identifier: [
+        { system: 'http://sedish-haiti.org/fhir/source-key', value: '54111-62' },
+        { system: 'http://isanteplus.org/openmrs/fhir2/3-isanteplus-id', value: '10020V' },
+      ],
+    }
+    const site54: R4.IPatient = {
+      resourceType: 'Patient',
+      id: 'src-54',
+      identifier: [{ system: 'http://sedish-haiti.org/fhir/source-key', value: '75101-73' }],
+    }
+    mockGotGet.mockImplementation(() => respond([]))
+
+    const result = await generateConsolidatedIpsBundle([golden, site44, site18, site54])
+    const subject = result.entry!.find(
+      e => (e as any).resourceType === 'Patient' && (e as any).id === 'gold-3',
+    ) as any
+    const sourceKeys = subject.identifier
+      .filter((i: any) => i.system === 'http://sedish-haiti.org/fhir/source-key')
+      .map((i: any) => i.value)
+    expect(sourceKeys.sort()).toEqual(['54111-62', '73106-96', '75101-73'])
+
+    // every other system still collapses to a single value
+    const isanteIds = subject.identifier.filter(
+      (i: any) => i.system === 'http://isanteplus.org/openmrs/fhir2/3-isanteplus-id',
+    )
+    expect(isanteIds).toHaveLength(1)
+  })
+
   it('falls back to the record itself when there is no golden tag (singleton)', async () => {
     mockGotGet.mockImplementation((url: string) => {
       if (url.includes('Observation?patient=Patient/lone-1')) return respond([obsFor('obs-9', 'lone-1')])
