@@ -377,6 +377,11 @@ export async function generateCrossFacilityIpsBundle(
 // OpenCR tags golden (master) records with this code on Patient.meta.tag.
 export const GOLDEN_RECORD_TAG = '5c827da5-4858-4f3d-a50c-62ece001efea'
 
+// The site-scoped record key (<mspp code>-<patient id>) each EMR identifies its own patient by. Same
+// setting the IPS routes resolve incoming lookups against.
+const SOURCE_KEY_SYSTEM: string =
+  config.get('app:mpiSystem') || 'http://sedish-haiti.org/fhir/source-key'
+
 // Clinical resource types gathered for a consolidated IPS, queried by the `patient` compartment
 // search param. This works even though Patient resources do NOT live in the SHR (demographics are
 // held only in the MPI/OpenCR per the SEDISH architecture), because clinical resources keep their
@@ -417,19 +422,27 @@ function mergeDemographics(golden: R4.IPatient, sources: R4.IPatient[]): R4.IPat
   const genderSrc = pick(p => !!p.gender)
   const birthSrc = pick(p => !!p.birthDate)
 
-  // The IPS subject is a single person, so show ONE identifier per system. A cross-facility golden
-  // aggregates several sources, each with its own facility-scoped source-key / iSantePlus ID; unioning
-  // them all makes the header list many source-keys and iSantePlus IDs. Keep the first value per system
-  // (golden first, then sources) and drop identifiers with no system (corruption).
+  // The IPS subject is a single person, so most systems show ONE identifier: a cross-facility golden
+  // aggregates several sources, and listing every site's iSantePlus ID would make the header unreadable.
+  //
+  // The source key is the exception and must be unioned. It is how a site recognises its own patient in
+  // a bundle: the requesting EMR checks the subject for ITS key before displaying anything. Keeping one
+  // meant the golden carried whichever site wrote last, so every other site saw a summary it could not
+  // identify and refused to display it — and the refusal moved from site to site with each sync.
+  // Identifiers with no system are corruption and are dropped either way.
   const seen = new Set<string>()
   const identifier: R4.IIdentifier[] = []
   for (const p of [golden, ...sources]) {
     for (const id of p.identifier || []) {
       const sys = id.system || ''
-      if (!sys || seen.has(sys)) {
+      if (!sys) {
         continue
       }
-      seen.add(sys)
+      const key = sys === SOURCE_KEY_SYSTEM ? `${sys}|${id.value || ''}` : sys
+      if (seen.has(key)) {
+        continue
+      }
+      seen.add(key)
       identifier.push(id)
     }
   }
